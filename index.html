@@ -62,20 +62,52 @@ const T = {
   fishChance:  0.5,                // golden fish spawn rate
   retryDelay:  0.9,                // seconds before retry tap is accepted
   dprCap:      2.5,
+  /* v3 — storms, lightning, gusts */
+  stormRamp:   1.5,                // s for rain to fade in/out at band edges
+  rainMax:      80,                // pooled rain streak cap (mid-phone safe)
+  rainSpdMin:  640,                // streak fall speed range px/s
+  rainSpdMax:  860,
+  boltGapMin:    2,                // s between lightning strikes (storm only)
+  boltGapMax:  4.5,                // ≈2-3 bolts per ~9 s band, not a strobe
+  gustStart:    90,                // score at which wind gusts begin
+  gustGapMin:    3,                // s between gusts
+  gustGapMax:    6,
+  gustTele:    0.6,                // telegraph lead time before the force
+  gustDur:     1.0,                // gust force duration
+  gustAccel:   340,                // peak gust accel px/s² (≈23% of gravity)
+  windStreaks:  12,                // pooled gust telegraph streaks
 };
 /* BEATABILITY CHECK ──────────────────────────────────────────────────────
-   At scrollMax (285) and spacing (252) there are 0.88 s between gaps.
-   A perfectly-timed flapper climbs ~210 px/s (each flap arcs 415→0 vy in
-   0.28 s covering ~58 px), i.e. ~185 px of climb between gaps, and falls
-   far faster.  Spawning clamps upward gap shifts to 120 px and downward
-   to 190 px, and consecutive obstacles SHARE an oscillation phase, so the
-   worst relative drift between neighbouring gaps at pass times is
-   2·oscAmpMax·sin(oscSpeedMax·0.88/2) ≈ 63 px (random phases could add a
-   full ±2·amp = 84 px on top of the clamp).  Worst required shift is
-   120 + 63 = 183 px against ~185 px of climb plus ±53 px of in-gap slack
+   At scrollMax (285) and spacing (252) there are 0.884 s between gaps.
+   A perfectly-timed flapper climbs flap/2 = 207.5 px/s (each flap arcs
+   415→0 vy in 0.28 s covering ~58 px) — a rate that is GRAVITY-
+   independent, so an active gust never lowers it — i.e. ~183 px of
+   climb between gaps, and falls far faster.  Spawning clamps upward gap
+   shifts to 120 px and downward to 190 px, and consecutive obstacles
+   SHARE an oscillation phase, so the worst relative drift between
+   neighbouring gaps at pass times is
+   2·oscAmpMax·sin(oscSpeedMax·0.884/2) ≈ 63 px (random phases could add
+   a full ±2·amp = 84 px on top of the clamp).  Worst required shift is
+   120 + 63 = 183 px against ~183 px of climb plus ±53 px of in-gap slack
    (gapMin/2 − gullR), so every consecutive pair of gaps stays physically
    threadable even at max difficulty.  Physics integrates trapezoidally,
-   so flap arc height is identical at any frame rate.                    */
+   so flap arc height is identical at any frame rate.
+   GUSTS (score 90+): peak accel A = gustAccel = 340 px/s² ≈ 23% of
+   gravity (under the 25% cap), half-sine envelope over D = gustDur =
+   1.0 s, telegraphed 0.6 s ahead by streaks + a direction-pitched
+   whoosh.  A fully IGNORED gust drifts the gull A·D²/π ≈ 108 px and
+   injects 2·A·D/π ≈ 216 px/s — barely half a flap impulse (415 px/s),
+   so a single flap-timing adjustment cancels it.  A player reacting
+   0.45 s into the force (a full second after the telegraph began) has
+   drifted only (A·D/π)·[t − (D/π)·sin(πt/D)] ≈ 15 px and carries
+   ~91 px/s to bleed (~15 px more at flap cadence) → ≈ 30 px realistic
+   worst case.  At 90+ the gap is pinned at gapMin (since 60) and osc
+   speed is capped (at 90), so the worst total is 120 + 63 + 30 = 213 px
+   against the 183 + 53 = 236 px budget — closes with ~24 px to spare.
+   Storm bands (60s/80s) are visual/audio only; bolts are gated to the
+   band itself, and the first gust telegraph can't begin until ≥3 s
+   (gustGapMin) after score 90 — past the 1.5 s rain fade-out — so storm
+   effects never coincide with a gust.                                  */
 
 const MEDALS = [
   { min: 100, name: "PEARL",  c1: "#ffffff", c2: "#cdd3f7", c3: "#9aa6e8" },
@@ -145,29 +177,43 @@ const ISLF_C  = [hx("#aacfdb"), hx("#8d9bc0"), hx("#39466a")];
 const SUN_C   = [hx("#fff4c8"), hx("#ffb266"), hx("#ffd296")];
 const CLOUD_C = [hx("#eef6fb"), hx("#ffe3d0"), hx("#9d9cc4")];  // day stop off-white so the gull reads in front
 
+/* storm grey-blue targets — blended over the day-dusk result by stormI */
+const ST_SKY  = [hx("#46586c"), hx("#5d6b7a"), hx("#75808d")];  // top/mid/hor
+const ST_WAT  = [hx("#33505f"), hx("#0c2030")];                 // top/bot
+const ST_LAND = hx("#56636f"), ST_CLOUD = hx("#9aa6b2");
+function smix(c, s, t) {        // lerp an rgb triplet toward the storm tint
+  return [c[0]+(s[0]-c[0])*t, c[1]+(s[1]-c[1])*t, c[2]+(s[2]-c[2])*t];
+}
+let stormI = 0;                // 0 clear → 1 storming (eased, never snaps)
+
 let phase = 0;                 // 0 day → 0.5 sunset → 1 dusk
 let palKey = -1;
 const P = {};                  // cached palette: gradients + colors
 function refreshPalette() {
-  const k = Math.round(phase * 64);
+  // stormI quantized to 1/16 — at 1/64 the 1.5 s ramp crossed a bucket
+  // nearly every frame, defeating the cache exactly when rain is ramping;
+  // the storm tint is only 0.55-weighted, so 1/16 steps are invisible
+  const k = Math.round(phase * 64) * 200 + Math.round(stormI * 16);
   if (k === palKey) return;
   palKey = k;
+  const sm = stormI * 0.55;        // storm blend on TOP of the phase result
   let g = ctx.createLinearGradient(0, 0, 0, VH - T.waterH);
-  g.addColorStop(0,    rgb(pal3(SKY_TOP, phase)));
-  g.addColorStop(0.55, rgb(pal3(SKY_MID, phase)));
-  g.addColorStop(1,    rgb(pal3(SKY_HOR, phase)));
+  g.addColorStop(0,    rgb(smix(pal3(SKY_TOP, phase), ST_SKY[0], sm)));
+  g.addColorStop(0.55, rgb(smix(pal3(SKY_MID, phase), ST_SKY[1], sm)));
+  g.addColorStop(1,    rgb(smix(pal3(SKY_HOR, phase), ST_SKY[2], sm)));
   P.sky = g;
   g = ctx.createLinearGradient(0, VH - T.waterH, 0, VH);
-  g.addColorStop(0, rgb(pal3(WAT_TOP, phase)));
-  g.addColorStop(1, rgb(pal3(WAT_BOT, phase)));
+  g.addColorStop(0, rgb(smix(pal3(WAT_TOP, phase), ST_WAT[0], sm)));
+  g.addColorStop(1, rgb(smix(pal3(WAT_BOT, phase), ST_WAT[1], sm)));
   P.water = g;
-  P.island    = rgb(pal3(ISL_C, phase));
-  P.islandFar = rgb(pal3(ISLF_C, phase));
+  P.island    = rgb(smix(pal3(ISL_C, phase), ST_LAND, sm));
+  P.islandFar = rgb(smix(pal3(ISLF_C, phase), ST_LAND, sm));
   P.sunFill   = rgb(pal3(SUN_C, phase));
-  const cl    = pal3(CLOUD_C, phase);
+  P.sunA      = 1 - stormI * 0.75; // sun hides behind the storm deck
+  const cl    = smix(pal3(CLOUD_C, phase), ST_CLOUD, sm);
   P.cloudFar  = rgba(cl, 0.5);     // precomposed — no rgba() churn per frame
   P.cloudNear = rgba(cl, 0.78);
-  P.starA     = clamp((phase - 0.62) / 0.38, 0, 1);
+  P.starA     = clamp((phase - 0.62) / 0.38, 0, 1) * (1 - stormI * 0.8);
 }
 
 const STARS = [];
@@ -178,9 +224,16 @@ for (let i = 0; i < 42; i++) {
 /* ═════════════════════════ AUDIO (WebAudio synth) ═════════════════════ */
 const AudioSys = (() => {
   let ac = null, master = null, noiseBuf = null;
+  let bedSrc = null, bedGain = null;   // looping storm rain/wind bed
   let muted = localStorage.getItem("gullRushMuted") === "1";
 
   function ensure() {
+    // iOS Safari (16.4+): route as media playback so the physical
+    // ringer/silent switch doesn't mute WebAudio. No-op elsewhere.
+    try {
+      if (navigator.audioSession && navigator.audioSession.type !== "playback")
+        navigator.audioSession.type = "playback";
+    } catch (e) {}
     if (!ac) {
       try {
         ac = new (window.AudioContext || window.webkitAudioContext)();
@@ -225,8 +278,26 @@ const AudioSys = (() => {
     src.connect(bp); bp.connect(g); g.connect(master);
     src.start(t0); src.stop(t0 + dur + 0.03);
   }
+  function stormBed(level) {         // low rain/wind noise bed — tracks stormI
+    if (!ac) return;                 // so the 70s/90s "eerie calm" is audible,
+    if (level > 0.001 && !bedSrc) {  // not just visual (storms start at score
+      bedSrc = ac.createBufferSource();      // 60, long after the first tap
+      bedSrc.buffer = noiseBuf; bedSrc.loop = true;  // created the context)
+      const lp = ac.createBiquadFilter();
+      lp.type = "lowpass"; lp.frequency.value = 480; lp.Q.value = 0.5;
+      bedGain = ac.createGain(); bedGain.gain.value = 0;
+      bedSrc.connect(lp); lp.connect(bedGain); bedGain.connect(master);
+      bedSrc.start();
+    }
+    if (bedGain) bedGain.gain.value = level * 0.055;  // eased by stormI itself
+    if (bedSrc && level <= 0.001) {  // fully faded — free the source
+      bedSrc.stop(); bedSrc.disconnect(); bedGain.disconnect();
+      bedSrc = null; bedGain = null;
+    }
+  }
   return {
     ensure,
+    stormBed,
     get muted() { return muted; },
     toggleMute() {
       muted = !muted;
@@ -238,6 +309,33 @@ const AudioSys = (() => {
     fish()   { if (!ensure()) return; tone(784, 784, 0.07, "square", 0.06); tone(1046, 1046, 0.07, "square", 0.06, 0.06); tone(1318, 1568, 0.12, "square", 0.05, 0.12); },
     hit()    { if (!ensure()) return; tone(220, 50, 0.28, "sawtooth", 0.15); noise(0.16, 0.12, 320, 110); },
     splash() { if (!ensure()) return; noise(0.45, 0.18, 1400, 180); tone(240, 70, 0.32, "sine", 0.06); },
+    ui()     { if (!ensure()) return; tone(740, 740, 0.05, "square", 0.045); },
+    whoosh(dir) {                    // pitch encodes gust direction: falling
+      if (!ensure()) return;         // sweep = down-gust, rising = up-gust
+      if (dir > 0) noise(0.7, 0.10, 1500, 260);
+      else         noise(0.7, 0.10, 260, 1500);
+    },
+    thunder(delay) {                 // low filtered-noise rumble, after the flash
+      if (!ensure()) return;
+      noise(1.6, 0.22, 190, 55, delay);
+      noise(1.1, 0.13, 95, 45, delay + 0.10);
+    },
+    milestone(d) {                   // decade chime: rising arpeggio, root climbs
+      if (!ensure()) return;        // +3 semitones per decade (10 low … 90 high)
+      const r = 392 * Math.pow(2, (Math.min(d, 12) - 1) / 4);
+      tone(r,        r,        0.10, "triangle", 0.13);  // louder than the
+      tone(r * 1.25, r * 1.25, 0.10, "triangle", 0.13, 0.09); // per-point blip
+      tone(r * 1.5,  r * 1.5,  0.18, "triangle", 0.13, 0.18);
+    },
+    pearl() {                        // score-100 fanfare: long shimmering run
+      if (!ensure()) return;
+      const seq = [523.25, 659.25, 783.99, 1046.5, 1318.5, 1568, 2093];
+      for (let i = 0; i < seq.length; i++)
+        tone(seq[i], seq[i], 0.30, "triangle", 0.09, i * 0.09);
+      tone(1046.5, 1046.5, 0.8, "sine", 0.05, 0.63);
+      tone(2093,   2637,   0.9, "sine", 0.04, 0.70);
+      noise(1.2, 0.04, 3000, 5600, 0.55);
+    },
   };
 })();
 
@@ -290,12 +388,136 @@ const S = { MENU: 0, PLAY: 1, DEAD: 2 };
 let state = S.MENU;
 let paused = false;
 let best = +(localStorage.getItem("gullRushBest") || 0);
+/* cached HUD strings — the menu/death panels redraw every frame (the world
+   animates behind them), so never concatenate in drawHUD (see scoreStr) */
+let bestLineMenu = "best  " + best, bestLineDead = "", entrySub = "";
 
 let time = 0, lastT = 0, oscPhase = 0;
 let gull, obstacles, fishes, floaters;
 let score, scoreStr, scorePop, speed, shake, flashT, deathT;
 let cloudsFar, cloudsNear, boats, islOff;
 let scoreFontSz = 0, scoreFont = "";   // cached HUD font string
+
+/* ─────────────── v3: milestones / storm / gust / board state ────────── */
+let lastMilestone = 0, milestoneGlow = 0;   // decade chime + HUD halo pulse
+
+let rainN = 0, rainVX = 0, lightT = 0, boltT = 0, stormWasOn = false;
+let gustMode = 0, gustClock = 0, gustDir = 1, gustWait = 0; // 0 idle/1 telegraph/2 force
+const RAIN = [];                            // pooled — never allocated per frame
+for (let i = 0; i < T.rainMax; i++) RAIN.push({ x: 0, y: 0, spd: 0, j: 1 });
+function seedRain(r, anywhere) {
+  r.x = rnd(-20, VW + 70);
+  r.y = anywhere ? rnd(-40, VH - T.waterH - 10) : rnd(-60, -8);
+  r.spd = rnd(T.rainSpdMin, T.rainSpdMax);
+  r.j = rnd(0.75, 1.25);
+}
+const WIND = [];                            // pooled gust telegraph streaks
+for (let i = 0; i < T.windStreaks; i++) WIND.push({ x: 0, y: 0, spd: 0, len: 0 });
+function seedWind() {
+  for (const w of WIND) {
+    w.x = rnd(0, VW + 80);
+    w.y = rnd(40, VH - T.waterH - 40);
+    w.spd = rnd(480, 760);
+    w.len = rnd(36, 70);
+  }
+}
+const BOLT_GRAD = (() => {                  // built ONCE — cool top-sky wash,
+  const g = ctx.createLinearGradient(0, 0, 0, (VH - T.waterH) * 0.7);
+  g.addColorStop(0, "rgba(185,212,255,0.9)");   // clearly bluer + dimmer than
+  g.addColorStop(1, "rgba(150,180,235,0)");     // the white death flash
+  return g;
+})();
+
+/* ── local arcade leaderboard (localStorage 'gullRushBoard') ── */
+const AZ = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+let board = (() => {
+  try {
+    const b = JSON.parse(localStorage.getItem("gullRushBoard") || "[]");
+    if (Array.isArray(b)) {
+      // reject NaN/Infinity scores + malformed initials, and re-sort:
+      // the insertion/qualification math assumes a descending board
+      const ok = b.filter(e => e && Number.isFinite(e.score) &&
+                          typeof e.initials === "string" &&
+                          /^[A-Z]{3}$/.test(e.initials));
+      ok.sort((x, y) => y.score - x.score);
+      return ok.slice(0, 10);
+    }
+  } catch (e) {}
+  return [];
+})();
+function saveBoard() {
+  try { localStorage.setItem("gullRushBoard", JSON.stringify(board)); } catch (e) {}
+}
+let boardRows = [];                  // cached "1.  ABC" / score row strings
+function refreshBoardRows() {        // rebuilt only when the board changes
+  boardRows = board.map((e, i) => [(i + 1) + ".  " + e.initials, "" + e.score]);
+}
+refreshBoardRows();
+let entryActive = false, entrySlot = 0, lastEntryIdx = -1;
+const entryLetters = [0, 0, 0];
+{                                           // arcade nicety: remember initials
+  const init = localStorage.getItem("gullRushInitials") || "";
+  for (let i = 0; i < 3; i++) {
+    const ix = AZ.indexOf(init[i]); if (ix >= 0) entryLetters[i] = ix;
+  }
+}
+const ENTRY = {                             // virtual-px hit rects — 44+ px
+                                            // AFTER scale<1 thanks to the tap
+                                            // slop in entryTap()
+  py: 96, cols: [VW / 2 - 78, VW / 2, VW / 2 + 78],
+  aw: 56, ah: 46, upY: 96 + 118, boxY: 96 + 168, boxH: 64, dnY: 96 + 240,
+  confirm: { x: VW / 2 - 112, y: 96 + 304, w: 224, h: 52 },
+  skip:    { x: VW / 2 - 70,  y: 96 + 364, w: 140, h: 44 },
+};
+function confirmEntry() {
+  const initials = AZ[entryLetters[0]] + AZ[entryLetters[1]] + AZ[entryLetters[2]];
+  try { localStorage.setItem("gullRushInitials", initials); } catch (e) {}
+  let i = 0;
+  while (i < board.length && board[i].score >= score) i++;
+  board.splice(i, 0, { initials, score });
+  if (board.length > 10) board.length = 10;
+  lastEntryIdx = i;
+  saveBoard();
+  refreshBoardRows();
+  entryActive = false;
+  deathT = 0;                      // re-fade the panel + re-arm the retry gate
+  AudioSys.fish();
+}
+function skipEntry() {
+  entryActive = false; lastEntryIdx = -1; deathT = 0; AudioSys.ui();
+}
+function entryTap(vx, vy) {        // while entry is active taps NEVER flap/retry
+  // ±6 px tap slop (like the mute button) so targets stay ≥44 CSS px when
+  // scale < 1 — arrows expand OUTWARD only, so the 4/8 px gaps to the
+  // letter boxes never become ambiguous; misses still no-op harmlessly
+  const sl = 6;
+  for (let i = 0; i < 3; i++) {
+    const cx = ENTRY.cols[i];
+    if (vx < cx - ENTRY.aw / 2 - sl || vx > cx + ENTRY.aw / 2 + sl) continue;
+    if (vy >= ENTRY.upY - sl && vy <= ENTRY.upY + ENTRY.ah) {
+      entryLetters[i] = (entryLetters[i] + 1) % 26; entrySlot = i; AudioSys.ui(); return;
+    }
+    if (vy >= ENTRY.dnY && vy <= ENTRY.dnY + ENTRY.ah + sl) {
+      entryLetters[i] = (entryLetters[i] + 25) % 26; entrySlot = i; AudioSys.ui(); return;
+    }
+    if (vy >= ENTRY.boxY && vy <= ENTRY.boxY + ENTRY.boxH) { entrySlot = i; AudioSys.ui(); return; }
+  }
+  // confirm grows +2 down / skip +2 up only — they sit 8 px apart
+  const c = ENTRY.confirm, s = ENTRY.skip;
+  if (vx >= c.x - sl && vx <= c.x + c.w + sl &&
+      vy >= c.y - sl && vy <= c.y + c.h + 2) { confirmEntry(); return; }
+  if (vx >= s.x - sl && vx <= s.x + s.w + sl &&
+      vy >= s.y - 2 && vy <= s.y + s.h + sl) { skipEntry(); return; }
+}
+function checkMilestone() {        // call after every score change — returns
+  const m = Math.floor(score / 10) * 10;  // true when the chime fired so the
+  if (m < 10 || m <= lastMilestone) return false; // caller can skip the per-
+  lastMilestone = m;                      // point blip (660 Hz sits a semitone
+  milestoneGlow = 1;                      // off the d=5/6 roots — dissonant)
+  floaters.push({ x: gull.x + 58, y: gull.y - 28, txt: m + "!", life: 1.3 });
+  if (m === 100) AudioSys.pearl(); else AudioSys.milestone(m / 10);
+  return true;
+}
 
 /* particle pool */
 const particles = [], pPool = [];
@@ -343,6 +565,11 @@ function reset() {
   speed = T.scrollBase;
   shake = 0; flashT = 0; deathT = 0;
   phase = 0; palKey = -1; oscPhase = 0;
+  lastMilestone = 0; milestoneGlow = 0;
+  stormI = 0; rainN = 0; boltT = 0; lightT = rnd(T.boltGapMin, T.boltGapMax);
+  stormWasOn = false;
+  gustMode = 0; gustWait = rnd(T.gustGapMin, T.gustGapMax);
+  entryActive = false;
   for (let i = 0; i < 4; i++) spawnObstacle(VW + 140 + i * T.spacing);
 }
 
@@ -406,7 +633,7 @@ function press() {
   }
   if (state === S.MENU) { state = S.PLAY; flapNow(); return; }
   if (state === S.PLAY) { flapNow(); return; }
-  if (state === S.DEAD && deathT > T.retryDelay) {
+  if (state === S.DEAD && !entryActive && deathT > T.retryDelay) {
     reset();
     state = S.PLAY;
     flapNow();
@@ -424,11 +651,24 @@ function handlePoint(clientX, clientY) {
     pausedDrawn = false;             // refresh the static pause frame's icon
     return;
   }
+  if (state === S.DEAD && entryActive) {
+    // arm only once the panel is visibly fading in (renders at 0.35 s) —
+    // death-mash taps in the first half second must never hit the
+    // invisible CONFIRM/skip targets; swallowed taps fall through to nothing
+    if (deathT > 0.5) entryTap(vx, vy);
+    return;
+  }
   press();
 }
-function onPointer(e) { e.preventDefault(); handlePoint(e.clientX, e.clientY); }
+function onPointer(e) {
+  e.preventDefault();
+  // a second resting finger must not double-step letters or hit CONFIRM
+  if (e.pointerType === "touch" && !e.isPrimary) return;
+  handlePoint(e.clientX, e.clientY);
+}
 function onTouch(e) {
   e.preventDefault();
+  if (e.touches.length > 1) return;  // ignore extra fingers (legacy path)
   const t = e.changedTouches[0];
   handlePoint(t.clientX, t.clientY);
 }
@@ -445,6 +685,24 @@ canvas.addEventListener("contextmenu", e => e.preventDefault());
 document.addEventListener("gesturestart", e => e.preventDefault());
 document.addEventListener("dblclick", e => e.preventDefault());
 window.addEventListener("keydown", e => {
+  // entry keys arm with the same delay as taps — an Enter mashed at the
+  // moment of impact must not confirm an invisible panel (keys that fall
+  // through to press() below still no-op while entryActive)
+  if (state === S.DEAD && entryActive && deathT > 0.5) {  // entry owns the keyboard
+    if (e.repeat) { e.preventDefault(); return; }
+    if (e.code.length === 4 && e.code.indexOf("Key") === 0) {
+      entryLetters[entrySlot] = AZ.indexOf(e.code[3]);
+      entrySlot = Math.min(2, entrySlot + 1);
+      AudioSys.ensure(); AudioSys.ui();
+    } else if (e.code === "Enter" || e.code === "NumpadEnter") { AudioSys.ensure(); confirmEntry(); }
+    else if (e.code === "ArrowUp")   { entryLetters[entrySlot] = (entryLetters[entrySlot] + 1) % 26; AudioSys.ensure(); AudioSys.ui(); }
+    else if (e.code === "ArrowDown") { entryLetters[entrySlot] = (entryLetters[entrySlot] + 25) % 26; AudioSys.ensure(); AudioSys.ui(); }
+    else if (e.code === "ArrowLeft" || e.code === "Backspace") entrySlot = Math.max(0, entrySlot - 1);
+    else if (e.code === "ArrowRight") entrySlot = Math.min(2, entrySlot + 1);
+    else if (e.code === "Escape") { AudioSys.ensure(); skipEntry(); }  // keyboard skip
+    e.preventDefault();                    // space/W never flap mid-entry
+    return;
+  }
   if (e.code === "Space" || e.code === "ArrowUp" || e.code === "KeyW") {
     e.preventDefault();
     if (e.repeat) return;
@@ -479,7 +737,20 @@ function die(splashed) {
   flashT = 0.22;
   gull.spin = Math.random() < 0.5 ? -7 : 7;
   AudioSys.hit();
-  if (score > best) { best = score; localStorage.setItem("gullRushBest", best); }
+  if (score > best) {
+    best = score;
+    bestLineMenu = "best  " + best;
+    // wrapped like saveBoard() — a storage-blocked browser (Lockdown Mode,
+    // old private browsing) must not abort die() before entryActive is set
+    try { localStorage.setItem("gullRushBest", best); } catch (e) {}
+  }
+  bestLineDead = (score >= best && score > 0 ? "★ new best  " : "best  ") + best;
+  entrySub = "score " + scoreStr + " — enter your initials";
+  gustMode = 0;                      // no gust force/streaks on the death screen
+  lastEntryIdx = -1;
+  if (score > 0 && (board.length < 10 || score > board[board.length - 1].score)) {
+    entryActive = true; entrySlot = 0;   // taps now go to initials entry ONLY
+  }
   if (splashed) {
     gull.splashed = true;
     makeSplash(gull.x, 24);
@@ -521,6 +792,48 @@ function update(dt) {
   }
   islOff = (islOff + worldSpd * 0.05 * dt) % (VW * 2);
 
+  /* ── storm bands: 60s & 80s storm, 70s & 90s clear — eased, never snaps */
+  const stormTgt = ((score >= 60 && score < 70) || (score >= 80 && score < 90)) ? 1 : 0;
+  if (stormTgt === 1 && !stormWasOn) lightT = rnd(1, 2.5); // each band opens
+  stormWasOn = stormTgt === 1;                             // with an early bolt
+  const dS = dt / T.stormRamp;
+  stormI += clamp(stormTgt - stormI, -dS, dS);
+  AudioSys.stormBed(stormI);                   // rain/wind bed fades with band
+
+  /* pooled rain — active count tracks intensity; objects never reallocated */
+  const targetRain = Math.round(stormI * T.rainMax);
+  while (rainN < targetRain) { seedRain(RAIN[rainN], true); rainN++; }
+  if (rainN > 0) {
+    rainVX = -(worldSpd * 0.55 + 28);          // streak angle follows scroll
+    const wy = VH - T.waterH;
+    for (let i = 0; i < rainN; i++) {
+      const r = RAIN[i];
+      r.x += rainVX * r.j * dt; r.y += r.spd * dt;
+      if (r.y > wy) {                          // tiny splash at the water line
+        emit(r.x, wy + 2, rnd(-26, 26), rnd(-120, -40), 0.22, 1.4, "#cfe4f2", 620);
+        if (rainN > targetRain) {              // fade-out: excess streaks DRAIN
+          rainN--;                             // at the waterline instead of
+          RAIN[i] = RAIN[rainN];               // vanishing mid-air (swap-remove
+          RAIN[rainN] = r;                     // keeps the active range
+          i--;                                 // contiguous; the swapped-in
+        }                                      // streak still gets its step)
+        else seedRain(r, false);
+      } else if (r.x < -30) r.x = VW + rnd(4, 60);
+    }
+  }
+
+  /* lightning: gated to the band ITSELF (stormTgt) so no flash/thunder can
+     spawn after the score leaves a storm decade — dim cool double-flicker */
+  boltT = Math.max(0, boltT - dt);
+  if (stormTgt === 1 && stormI > 0.6 && state === S.PLAY) {
+    lightT -= dt;
+    if (lightT <= 0) {
+      lightT = rnd(T.boltGapMin, T.boltGapMax);
+      boltT = 0.3;
+      AudioSys.thunder(rnd(0.3, 0.8));
+    }
+  }
+
   stepParticles(dt);
   for (let i = floaters.length - 1; i >= 0; i--) {
     const f = floaters[i];
@@ -528,6 +841,7 @@ function update(dt) {
     if (f.life <= 0) floaters.splice(i, 1);
   }
   scorePop = Math.max(0, scorePop - dt * 3.2);
+  milestoneGlow = Math.max(0, milestoneGlow - dt * 1.4);
   shake = Math.max(0, shake - dt * 55);
   flashT = Math.max(0, flashT - dt);
   if (gull) gull.flapT = Math.max(0, gull.flapT - dt * 4.5);
@@ -548,11 +862,42 @@ function update(dt) {
     const targetSpd = Math.min(T.scrollBase + score * T.scrollRamp, T.scrollMax);
     speed += (targetSpd - speed) * Math.min(1, dt * 2);
 
+    /* wind gusts (90+): 0.6 s telegraph (streaks + whoosh), then a 1 s
+       half-sine vertical push capped at ~23% of gravity — see BEATABILITY */
+    if (score >= T.gustStart) {
+      if (gustMode === 0) {
+        gustWait -= dt;
+        if (gustWait <= 0) {
+          gustMode = 1; gustClock = T.gustTele;
+          gustDir = Math.random() < 0.5 ? -1 : 1;
+          seedWind();
+          AudioSys.whoosh(gustDir);  // sweep direction matches the push
+        }
+      } else {
+        gustClock -= dt;
+        if (gustMode === 1 && gustClock <= 0) { gustMode = 2; gustClock = T.gustDur; }
+        else if (gustMode === 2 && gustClock <= 0) {
+          gustMode = 0; gustWait = rnd(T.gustGapMin, T.gustGapMax);
+        }
+      }
+      if (gustMode) {                // pooled streaks sweep in gust direction
+        for (const w of WIND) {
+          w.x -= w.spd * dt; w.y += gustDir * w.spd * 0.25 * dt;
+          if (w.x < -w.len) { w.x = VW + rnd(10, 90); w.y = rnd(40, VH - T.waterH - 40); }
+          if (w.y < 24) w.y = VH - T.waterH - 44;
+          else if (w.y > VH - T.waterH - 14) w.y = 34;
+        }
+      }
+    }
+
     // gull physics — trapezoidal integration, so flap arc height is
     // identical at 20 fps and 120 fps (semi-implicit Euler loses ~15%
     // of climb at the dt=0.05 clamp)
     const vy0 = gull.vy;
-    gull.vy = clamp(gull.vy + T.gravity * dt, T.flap, T.maxFall);
+    let grav = T.gravity;
+    if (gustMode === 2)
+      grav += gustDir * T.gustAccel * Math.sin(Math.PI * (1 - gustClock / T.gustDur));
+    gull.vy = clamp(gull.vy + grav * dt, T.flap, T.maxFall);
     gull.y += (vy0 + gull.vy) * 0.5 * dt;
     const targetRot = clamp(gull.vy / 580, -0.45, 1.25);
     gull.rot += (targetRot - gull.rot) * Math.min(1, dt * 14);
@@ -570,7 +915,9 @@ function update(dt) {
         score++;
         scoreStr = "" + score;
         scorePop = 1;
-        AudioSys.score();
+        if (!checkMilestone()) AudioSys.score(); // chime owns the frame — the
+                                                 // blip would smear it by a
+                                                 // semitone at decades 5/6
       }
       if (gull.alive) {
         const gy = gapYOf(ob);       // collide against CURRENT gap position
@@ -608,7 +955,7 @@ function update(dt) {
         score += 3;
         scoreStr = "" + score;
         scorePop = 1;
-        AudioSys.fish();
+        if (!checkMilestone()) AudioSys.fish();  // same gate as the blip
         floaters.push({ x: f.x, y: fy - 12, txt: "+3", life: 0.9 });
         for (let j = 0; j < 14; j++) {
           emit(f.x, fy, rnd(-150, 150), rnd(-160, 120),
@@ -659,12 +1006,27 @@ function drawSky() {
   const e = phase * phase;
   const sx = VW - 78 - phase * 70;
   const sy = lerp(96, VH - T.waterH - 36, e);
-  ctx.globalAlpha = 0.30 * (1 - phase * 0.5);
+  ctx.globalAlpha = 0.30 * (1 - phase * 0.5) * P.sunA;
   ctx.fillStyle = P.sunFill;
   ctx.beginPath(); ctx.arc(sx, sy, 72, 0, Math.PI * 2); ctx.fill();
-  ctx.globalAlpha = 0.85 - phase * 0.35;
+  ctx.globalAlpha = (0.85 - phase * 0.35) * P.sunA;
   ctx.beginPath(); ctx.arc(sx, sy, 42, 0, Math.PI * 2); ctx.fill();
   ctx.globalAlpha = 1;
+
+  // lightning: dim blue-white wash from the top of the sky — a quick
+  // DOUBLE flicker, deliberately nothing like the full-white death flash
+  if (boltT > 0) {
+    const t = 0.3 - boltT;
+    const s1 = Math.max(0, 1 - Math.abs(t - 0.04) / 0.05);
+    const s2 = Math.max(0, 1 - Math.abs(t - 0.17) / 0.08);
+    const a = Math.max(s1 * 0.8, s2) * 0.45;
+    if (a > 0.01) {
+      ctx.globalAlpha = a;
+      ctx.fillStyle = BOLT_GRAD;
+      ctx.fillRect(0, 0, VW, (VH - T.waterH) * 0.7);
+      ctx.globalAlpha = 1;
+    }
+  }
 }
 
 function puff(x, y, r) { ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, Math.PI * 2); }
@@ -1000,6 +1362,41 @@ function drawParticles() {
   ctx.globalAlpha = 1;
 }
 
+let rainAQ = -1, rainStroke = "";    // stroke alpha follows stormI so streaks
+function drawRain() {                // seeded mid-air on fade-in are invisible;
+  if (!rainN) return;                // quantized to 1/16 — ~17 strings per
+  const q = Math.round(clamp(stormI, 0, 1) * 16);     // transition, not per
+  if (q === 0) return;                                // frame
+  if (q !== rainAQ) { rainAQ = q; rainStroke = "rgba(205,228,242," + q * 0.025 + ")"; }
+  ctx.strokeStyle = rainStroke;      // one path + one stroke for all streaks
+  ctx.lineWidth = 1.4;
+  ctx.beginPath();
+  for (let i = 0; i < rainN; i++) {
+    const r = RAIN[i];
+    ctx.moveTo(r.x, r.y);
+    ctx.lineTo(r.x - rainVX * r.j * 0.045, r.y - r.spd * 0.045);
+  }
+  ctx.stroke();
+}
+
+function drawWind() {
+  if (!gustMode) return;
+  const a = gustMode === 1           // ramp in over the telegraph, fade out
+    ? Math.min(1, (T.gustTele - gustClock) / 0.18)
+    : Math.min(1, gustClock / 0.3);
+  if (a <= 0.01) return;
+  ctx.globalAlpha = a * 0.6;
+  ctx.strokeStyle = "#f0f7ff";       // pale — reads on the dark dusk sky
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (const w of WIND) {
+    ctx.moveTo(w.x, w.y);
+    ctx.lineTo(w.x + w.len, w.y - gustDir * w.len * 0.25);
+  }
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+
 function drawFloaters() {
   if (!floaters.length) return;      // skip the (pricey) ctx.font set when idle
   ctx.textAlign = "center";
@@ -1094,6 +1491,50 @@ function drawMedal(cx, cy, m) {
   ctx.closePath(); ctx.fill();
 }
 
+function drawEntryArrow(cx, y, up, hot) {
+  ctx.fillStyle = hot ? "rgba(255,255,255,0.16)" : "rgba(255,255,255,0.08)";
+  roundRect(cx - ENTRY.aw / 2, y, ENTRY.aw, ENTRY.ah, 10);
+  ctx.fill();
+  ctx.fillStyle = "#eaf4f8";
+  ctx.beginPath();
+  if (up) { ctx.moveTo(cx, y + 12); ctx.lineTo(cx + 11, y + 32); ctx.lineTo(cx - 11, y + 32); }
+  else    { ctx.moveTo(cx, y + 34); ctx.lineTo(cx + 11, y + 14); ctx.lineTo(cx - 11, y + 14); }
+  ctx.closePath(); ctx.fill();
+}
+
+function drawEntryPanel() {
+  const py = ENTRY.py;
+  panel(py, 420);
+  ctx.fillStyle = "#fff";
+  ctx.font = "800 30px -apple-system, system-ui, sans-serif";
+  ctx.fillText("TOP 10 SPLASH!", VW / 2, py + 44);
+  ctx.font = "600 16px -apple-system, system-ui, sans-serif";
+  ctx.fillStyle = "#cfe8f2";
+  ctx.fillText(entrySub, VW / 2, py + 76);   // cached in die() — no per-frame concat
+  ctx.font = "800 42px -apple-system, system-ui, sans-serif"; // once, not ×3
+  for (let i = 0; i < 3; i++) {
+    const cx = ENTRY.cols[i], hot = i === entrySlot;
+    drawEntryArrow(cx, ENTRY.upY, true, hot);
+    ctx.fillStyle = hot ? "rgba(255,210,74,0.14)" : "rgba(255,255,255,0.06)";
+    roundRect(cx - 28, ENTRY.boxY, 56, ENTRY.boxH, 10); ctx.fill();
+    ctx.strokeStyle = hot ? "#ffd24a" : "rgba(255,255,255,0.3)";
+    ctx.lineWidth = 2;
+    roundRect(cx - 28, ENTRY.boxY, 56, ENTRY.boxH, 10); ctx.stroke();
+    ctx.fillStyle = "#fff";
+    ctx.fillText(AZ[entryLetters[i]], cx, ENTRY.boxY + 46);
+    drawEntryArrow(cx, ENTRY.dnY, false, hot);
+  }
+  const c = ENTRY.confirm;
+  ctx.fillStyle = "rgba(255,210,74,0.92)";
+  roundRect(c.x, c.y, c.w, c.h, 14); ctx.fill();
+  ctx.fillStyle = "#1c2b35";
+  ctx.font = "800 24px -apple-system, system-ui, sans-serif";
+  ctx.fillText("CONFIRM", VW / 2, c.y + 35);
+  ctx.fillStyle = "#9fc4d4";
+  ctx.font = "600 17px -apple-system, system-ui, sans-serif";
+  ctx.fillText("skip", VW / 2, ENTRY.skip.y + 28);
+}
+
 function drawHUD() {
   ctx.textAlign = "center";
 
@@ -1104,6 +1545,12 @@ function drawHUD() {
       scoreFont = "800 " + sz + "px -apple-system, system-ui, sans-serif";
     }
     ctx.font = scoreFont;
+    if (milestoneGlow > 0.01) {      // gold halo pulse on decade milestones
+      ctx.globalAlpha = milestoneGlow;
+      ctx.strokeStyle = "#ffd24a"; ctx.lineWidth = 10;
+      ctx.strokeText(scoreStr, VW / 2, 92);
+      ctx.globalAlpha = 1;
+    }
     ctx.strokeStyle = "rgba(255,255,255,0.92)"; ctx.lineWidth = 5;
     ctx.strokeText(scoreStr, VW / 2, 92);
     ctx.fillStyle = "rgba(16,40,52,0.9)";
@@ -1115,21 +1562,31 @@ function drawHUD() {
     ctx.fillStyle = "#fff";
     ctx.font = "800 46px -apple-system, system-ui, sans-serif";
     ctx.fillText("GULL RUSH", VW / 2, VH * 0.20 + 64 + Math.sin(time * 2.2) * 3);
-    ctx.font = "600 17px -apple-system, system-ui, sans-serif";
+    ctx.font = "600 16px -apple-system, system-ui, sans-serif";
     ctx.fillStyle = "#cfe8f2";
-    ctx.fillText("tap · space · ↑ to flap", VW / 2, VH * 0.20 + 108);
-    ctx.fillText("thread the buoys", VW / 2, VH * 0.20 + 134);
+    ctx.fillText("tap · space · ↑ to flap", VW / 2, VH * 0.20 + 102);
     ctx.fillStyle = "#ffd24a";
-    ctx.fillText("golden fish = +3", VW / 2, VH * 0.20 + 160);
-    pulseText("TAP TO START", VH * 0.20 + 212);
+    ctx.fillText("thread the buoys · golden fish = +3", VW / 2, VH * 0.20 + 126);
+    ctx.font = "700 15px -apple-system, system-ui, sans-serif";
+    ctx.fillStyle = "#fff";
+    ctx.fillText("goal: get to 100 & reach the pearl", VW / 2, VH * 0.20 + 160);
+    ctx.fillStyle = "#ff9b6b";
+    ctx.fillText("or are you gonna rage quit?", VW / 2, VH * 0.20 + 182);
+    pulseText("TAP TO START", VH * 0.20 + 222);
     ctx.font = "600 16px -apple-system, system-ui, sans-serif";
     ctx.fillStyle = "#9fc4d4";
-    ctx.fillText("best  " + best, VW / 2, VH * 0.20 + 252);
+    ctx.fillText(bestLineMenu, VW / 2, VH * 0.20 + 256);
   }
 
   if (state === S.DEAD && deathT > 0.35) {
     const a = clamp((deathT - 0.35) / 0.3, 0, 1);
     ctx.globalAlpha = a;
+    if (entryActive) {
+      drawEntryPanel();
+      ctx.globalAlpha = 1;
+      drawMuteBtn();
+      return;
+    }
     const py = VH * 0.20;
     panel(py, VH * 0.46);
     ctx.fillStyle = "#fff";
@@ -1145,23 +1602,51 @@ function drawHUD() {
       ctx.fillText(medal.name, VW / 2 - 92, py + 160);
     }
     const tx = medal ? VW / 2 + 36 : VW / 2;
-    ctx.fillStyle = "#cfe8f2";
+    const isNewBest = score >= best && score > 0;
+    // both 16px lines drawn in one font run — fewer ctx.font parses/frame
     ctx.font = "600 16px -apple-system, system-ui, sans-serif";
+    ctx.fillStyle = "#cfe8f2";
     ctx.fillText("SCORE", tx, py + 102);
+    ctx.fillStyle = isNewBest ? "#ffd24a" : "#9fc4d4";
+    ctx.fillText(bestLineDead, tx, py + 166);  // cached in die()
     ctx.fillStyle = "#fff";
     ctx.font = "800 34px -apple-system, system-ui, sans-serif";
     ctx.fillText(scoreStr, tx, py + 136);
-    const isNewBest = score >= best && score > 0;
-    ctx.font = "600 16px -apple-system, system-ui, sans-serif";
-    ctx.fillStyle = isNewBest ? "#ffd24a" : "#9fc4d4";
-    ctx.fillText(isNewBest ? "★ new best  " + best : "best  " + best, tx, py + 166);
 
-    if (deathT > T.retryDelay) pulseText("TAP TO RETRY", py + 232);
+    // top-10 board — compact 5-row window, new entry kept visible/highlit
+    let retryY = py + 232;
+    if (board.length) {
+      retryY = py + 312;             // clear of the 5th row's gold highlight
+      const n = Math.min(5, board.length);
+      const start = lastEntryIdx >= 0
+        ? clamp(lastEntryIdx - 2, 0, Math.max(0, board.length - n)) : 0;
+      ctx.font = "700 12px -apple-system, system-ui, sans-serif";
+      ctx.fillStyle = "#9fc4d4";
+      // header stops claiming "top" when the window starts below rank 1
+      ctx.fillText(start > 0 ? "· LEADERBOARD ·" : "· TOP SCORES ·", VW / 2, py + 188);
+      ctx.font = "700 15px -apple-system, system-ui, sans-serif";
+      for (let i = 0; i < n; i++) {
+        const row = start + i, y = py + 208 + i * 17;
+        if (row === lastEntryIdx) {
+          ctx.fillStyle = "rgba(255,210,74,0.16)";
+          roundRect(VW / 2 - 92, y - 13, 184, 17, 5);
+          ctx.fill();
+        }
+        ctx.fillStyle = row === lastEntryIdx ? "#ffd24a" : "#cfe8f2";
+        ctx.textAlign = "left";
+        ctx.fillText(boardRows[row][0], VW / 2 - 78, y);   // cached strings —
+        ctx.textAlign = "right";                           // rebuilt only when
+        ctx.fillText(boardRows[row][1], VW / 2 + 78, y);   // the board changes
+      }
+      ctx.textAlign = "center";
+    }
+
+    if (deathT > T.retryDelay) pulseText("TAP TO RETRY", retryY);
     else if (deathT > 0.5) {         // delayed so the dim prompt doesn't imply taps work yet
       ctx.globalAlpha = a * 0.4;
       ctx.fillStyle = "#ffd24a";
       ctx.font = "800 27px -apple-system, system-ui, sans-serif";
-      ctx.fillText("TAP TO RETRY", VW / 2, py + 232);
+      ctx.fillText("TAP TO RETRY", VW / 2, retryY);
     }
     ctx.globalAlpha = 1;
   }
@@ -1201,6 +1686,8 @@ function draw() {
   drawFishes();
   drawParticles();
   drawGull();
+  drawRain();
+  drawWind();
   drawWaterFront();
   drawFloaters();
 
@@ -1221,6 +1708,7 @@ function frame(now) {
   lastT = now;
   if (dt > 0.05) dt = 0.05;   // clamp tab-switch spikes
   if (paused) {
+    AudioSys.stormBed(0);            // silence the rain bed on the frozen frame
     // nothing animates while paused — draw the frozen frame once, then
     // skip redraws entirely (battery/thermals during auto-pause)
     if (!pausedDrawn) { draw(); pausedDrawn = true; }

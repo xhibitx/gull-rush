@@ -1,0 +1,1241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#071a28">
+<title>Gull Rush</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html, body {
+    position:fixed; inset:0; width:100%; height:100%;
+    overflow:hidden;
+    background:#071a28;
+    font-family:-apple-system,"Segoe UI",system-ui,sans-serif;
+    user-select:none; -webkit-user-select:none;
+    touch-action:none;
+    overscroll-behavior:none;
+  }
+  #wrap {
+    position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+    padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px)
+             env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px);
+  }
+  canvas {
+    display:block;
+    touch-action:none;
+    cursor:pointer;
+    box-shadow:0 0 80px rgba(0,0,0,.55);
+  }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game"></canvas></div>
+<script>
+(() => {
+"use strict";
+
+/* ════════════════════════════ TUNABLES ════════════════════════════════ */
+const VW = 400, VH = 700;          // virtual resolution (portrait)
+const T = {
+  gravity:    1480,                // px/s^2
+  flap:       -415,                // impulse velocity on tap
+  maxFall:     700,                // terminal velocity
+  scrollBase:  165,                // world speed at score 0
+  scrollRamp:  3.4,                // +px/s per point
+  scrollMax:   285,                // speed cap
+  spacing:     252,                // horizontal distance between obstacles
+  gapBase:     168,                // starting gap height
+  gapShrink:   0.5,                // gap shrink per point
+  gapMin:      138,                // tightest gap (reached at score 60)
+  buoyW:        60,                // obstacle column width
+  gullX:       112,                // gull's fixed x
+  gullR:        16,                // collision radius
+  waterH:       86,                // ocean band height
+  oscStart:     12,                // score at which gaps begin to oscillate
+  oscAmpPer:   1.6,                // amplitude px per point past oscStart
+  oscAmpMax:    42,                // amplitude cap
+  oscSpeed:   1.35,                // rad/s of gap oscillation at the start
+  oscSpeedMax: 1.9,                // rad/s late game (ramps over scores 40→90)
+  fishChance:  0.5,                // golden fish spawn rate
+  retryDelay:  0.9,                // seconds before retry tap is accepted
+  dprCap:      2.5,
+};
+/* BEATABILITY CHECK ──────────────────────────────────────────────────────
+   At scrollMax (285) and spacing (252) there are 0.88 s between gaps.
+   A perfectly-timed flapper climbs ~210 px/s (each flap arcs 415→0 vy in
+   0.28 s covering ~58 px), i.e. ~185 px of climb between gaps, and falls
+   far faster.  Spawning clamps upward gap shifts to 120 px and downward
+   to 190 px, and consecutive obstacles SHARE an oscillation phase, so the
+   worst relative drift between neighbouring gaps at pass times is
+   2·oscAmpMax·sin(oscSpeedMax·0.88/2) ≈ 63 px (random phases could add a
+   full ±2·amp = 84 px on top of the clamp).  Worst required shift is
+   120 + 63 = 183 px against ~185 px of climb plus ±53 px of in-gap slack
+   (gapMin/2 − gullR), so every consecutive pair of gaps stays physically
+   threadable even at max difficulty.  Physics integrates trapezoidally,
+   so flap arc height is identical at any frame rate.                    */
+
+const MEDALS = [
+  { min: 100, name: "PEARL",  c1: "#ffffff", c2: "#cdd3f7", c3: "#9aa6e8" },
+  { min:  50, name: "GOLD",   c1: "#fff3c0", c2: "#ffce4f", c3: "#cf8a1d" },
+  { min:  25, name: "SILVER", c1: "#ffffff", c2: "#c4cfd8", c3: "#8d9ca8" },
+  { min:  10, name: "BRONZE", c1: "#f3c298", c2: "#cd7f43", c3: "#8a4f22" },
+];
+
+/* ═══════════════════════ CANVAS / SCALING ═════════════════════════════ */
+const canvas = document.getElementById("game");
+const wrap = document.getElementById("wrap");
+const ctx = canvas.getContext("2d");
+let scale = 1, DPR = 1, pausedDrawn = false;
+
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, T.dprCap);
+  // subtract safe-area insets (#wrap padding) so the canvas clears the
+  // home indicator / notch in standalone + viewport-fit=cover mode
+  const cs = getComputedStyle(wrap);
+  const availW = window.innerWidth  -
+    ((parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.paddingRight)  || 0));
+  const availH = window.innerHeight -
+    ((parseFloat(cs.paddingTop)  || 0) + (parseFloat(cs.paddingBottom) || 0));
+  scale = Math.min(availW / VW, availH / VH);
+  canvas.style.width  = Math.round(VW * scale) + "px";
+  canvas.style.height = Math.round(VH * scale) + "px";
+  canvas.width  = Math.round(VW * scale * DPR);
+  canvas.height = Math.round(VH * scale * DPR);
+  pausedDrawn = false;             // resizing clears the canvas — redraw even if paused
+}
+window.addEventListener("resize", resize);
+window.addEventListener("orientationchange", resize);
+resize();
+
+/* ═════════════════════════════ HELPERS ════════════════════════════════ */
+function rnd(a, b)      { return a + Math.random() * (b - a); }
+function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+function lerp(a, b, t)  { return a + (b - a) * t; }
+function hx(h) { return [parseInt(h.slice(1,3),16), parseInt(h.slice(3,5),16), parseInt(h.slice(5,7),16)]; }
+function pal3(a, ph) {  // lerp across 3 rgb stops, ph in [0,1]
+  const t = clamp(ph, 0, 1) * 2;
+  const i = t < 1 ? 0 : 1, f = t - i;
+  const c0 = a[i], c1 = a[i + 1];
+  return [c0[0]+(c1[0]-c0[0])*f, c0[1]+(c1[1]-c0[1])*f, c0[2]+(c1[2]-c0[2])*f];
+}
+function rgb(c)     { return "rgb(" + (c[0]|0) + "," + (c[1]|0) + "," + (c[2]|0) + ")"; }
+function rgba(c, a) { return "rgba(" + (c[0]|0) + "," + (c[1]|0) + "," + (c[2]|0) + "," + a + ")"; }
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+/* ════════════ DAY → SUNSET → DUSK PALETTES (lerped by score) ══════════ */
+const SKY_TOP = [hx("#7fcdee"), hx("#6b74c0"), hx("#131c40")];
+const SKY_MID = [hx("#c6ebf7"), hx("#ef9a6f"), hx("#3c3f74")];
+const SKY_HOR = [hx("#fdf2d9"), hx("#ffd9a0"), hx("#7c5380")];
+const WAT_TOP = [hx("#39b0c2"), hx("#3a7da3"), hx("#1b3a64")];
+const WAT_BOT = [hx("#0e6a86"), hx("#15375c"), hx("#071830")];
+const ISL_C   = [hx("#7fae8e"), hx("#5d7a73"), hx("#2c3a52")];
+const ISLF_C  = [hx("#aacfdb"), hx("#8d9bc0"), hx("#39466a")];
+const SUN_C   = [hx("#fff4c8"), hx("#ffb266"), hx("#ffd296")];
+const CLOUD_C = [hx("#eef6fb"), hx("#ffe3d0"), hx("#9d9cc4")];  // day stop off-white so the gull reads in front
+
+let phase = 0;                 // 0 day → 0.5 sunset → 1 dusk
+let palKey = -1;
+const P = {};                  // cached palette: gradients + colors
+function refreshPalette() {
+  const k = Math.round(phase * 64);
+  if (k === palKey) return;
+  palKey = k;
+  let g = ctx.createLinearGradient(0, 0, 0, VH - T.waterH);
+  g.addColorStop(0,    rgb(pal3(SKY_TOP, phase)));
+  g.addColorStop(0.55, rgb(pal3(SKY_MID, phase)));
+  g.addColorStop(1,    rgb(pal3(SKY_HOR, phase)));
+  P.sky = g;
+  g = ctx.createLinearGradient(0, VH - T.waterH, 0, VH);
+  g.addColorStop(0, rgb(pal3(WAT_TOP, phase)));
+  g.addColorStop(1, rgb(pal3(WAT_BOT, phase)));
+  P.water = g;
+  P.island    = rgb(pal3(ISL_C, phase));
+  P.islandFar = rgb(pal3(ISLF_C, phase));
+  P.sunFill   = rgb(pal3(SUN_C, phase));
+  const cl    = pal3(CLOUD_C, phase);
+  P.cloudFar  = rgba(cl, 0.5);     // precomposed — no rgba() churn per frame
+  P.cloudNear = rgba(cl, 0.78);
+  P.starA     = clamp((phase - 0.62) / 0.38, 0, 1);
+}
+
+const STARS = [];
+for (let i = 0; i < 42; i++) {
+  STARS.push({ x: rnd(8, VW - 8), y: rnd(10, VH * 0.5), r: rnd(0.6, 1.6), tw: rnd(0, 6.28) });
+}
+
+/* ═════════════════════════ AUDIO (WebAudio synth) ═════════════════════ */
+const AudioSys = (() => {
+  let ac = null, master = null, noiseBuf = null;
+  let muted = localStorage.getItem("gullRushMuted") === "1";
+
+  function ensure() {
+    if (!ac) {
+      try {
+        ac = new (window.AudioContext || window.webkitAudioContext)();
+        master = ac.createGain();
+        master.gain.value = muted ? 0 : 1;
+        master.connect(ac.destination);
+        const len = (ac.sampleRate * 0.5) | 0;
+        noiseBuf = ac.createBuffer(1, len, ac.sampleRate);
+        const d = noiseBuf.getChannelData(0);
+        for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+      } catch (e) { ac = null; }
+    }
+    // !== "running" also covers iOS WebKit's non-standard "interrupted"
+    // state (phone call / Siri / backgrounding) which never auto-resumes
+    if (ac && ac.state !== "running") ac.resume();
+    return ac;
+  }
+  function tone(f0, f1, dur, type, vol, delay) {
+    if (!ac) return;
+    const t0 = ac.currentTime + (delay || 0);
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f0, t0);
+    if (f1 !== f0) o.frequency.exponentialRampToValueAtTime(Math.max(1, f1), t0 + dur);
+    g.gain.setValueAtTime(vol, t0);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g); g.connect(master);
+    o.start(t0); o.stop(t0 + dur + 0.03);
+  }
+  function noise(dur, vol, f0, f1, delay) {
+    if (!ac) return;
+    const t0 = ac.currentTime + (delay || 0);
+    const src = ac.createBufferSource();
+    src.buffer = noiseBuf; src.loop = true;
+    const bp = ac.createBiquadFilter();
+    bp.type = "bandpass"; bp.Q.value = 0.9;
+    bp.frequency.setValueAtTime(f0, t0);
+    bp.frequency.exponentialRampToValueAtTime(Math.max(40, f1), t0 + dur);
+    const g = ac.createGain();
+    g.gain.setValueAtTime(vol, t0);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    src.connect(bp); bp.connect(g); g.connect(master);
+    src.start(t0); src.stop(t0 + dur + 0.03);
+  }
+  return {
+    ensure,
+    get muted() { return muted; },
+    toggleMute() {
+      muted = !muted;
+      localStorage.setItem("gullRushMuted", muted ? "1" : "0");
+      if (master) master.gain.value = muted ? 0 : 1;
+    },
+    flap()   { if (!ensure()) return; tone(430, 760, 0.09, "sine", 0.07); noise(0.07, 0.05, 900, 2400); },
+    score()  { if (!ensure()) return; tone(660, 660, 0.07, "triangle", 0.09); tone(990, 990, 0.09, "triangle", 0.08, 0.07); },
+    fish()   { if (!ensure()) return; tone(784, 784, 0.07, "square", 0.06); tone(1046, 1046, 0.07, "square", 0.06, 0.06); tone(1318, 1568, 0.12, "square", 0.05, 0.12); },
+    hit()    { if (!ensure()) return; tone(220, 50, 0.28, "sawtooth", 0.15); noise(0.16, 0.12, 320, 110); },
+    splash() { if (!ensure()) return; noise(0.45, 0.18, 1400, 180); tone(240, 70, 0.32, "sine", 0.06); },
+  };
+})();
+
+/* ════════════════════ PRE-RENDERED BUOY SPRITE ════════════════════════
+   Buoys use a radial gradient + stripes; rendering ~40 of those per frame
+   with live gradients is slow on phones, so we bake one sprite once.    */
+const buoySprite = (() => {
+  const r = T.buoyW / 2, ss = 3, pad = 4;
+  const c = document.createElement("canvas");
+  const size = Math.ceil((r + pad) * 2 * ss);
+  c.width = size; c.height = size;
+  const x = c.getContext("2d");
+  x.scale(ss, ss);
+  const cx = r + pad, cy = r + pad;
+  // red body
+  let g = x.createRadialGradient(cx - r * 0.35, cy - r * 0.42, r * 0.15, cx, cy, r * 1.06);
+  g.addColorStop(0, "#ff8264");
+  g.addColorStop(0.55, "#e0433a");
+  g.addColorStop(1, "#971e26");
+  x.fillStyle = g;
+  x.beginPath(); x.arc(cx, cy, r, 0, Math.PI * 2); x.fill();
+  // white stripes (clipped to the sphere)
+  x.save();
+  x.beginPath(); x.arc(cx, cy, r, 0, Math.PI * 2); x.clip();
+  x.fillStyle = "#f7f4ec";
+  x.fillRect(cx - r, cy - r * 0.40, r * 2, r * 0.30);
+  x.fillRect(cx - r, cy + r * 0.18, r * 2, r * 0.26);
+  // shading overlay to keep the sphere illusion across stripes
+  g = x.createLinearGradient(cx - r, 0, cx + r, 0);
+  g.addColorStop(0, "rgba(60,16,18,0.38)");
+  g.addColorStop(0.33, "rgba(255,255,255,0)");
+  g.addColorStop(1, "rgba(60,16,18,0.45)");
+  x.fillStyle = g;
+  x.fillRect(cx - r, cy - r, r * 2, r * 2);
+  x.restore();
+  // glossy highlight
+  x.fillStyle = "rgba(255,255,255,0.55)";
+  x.beginPath(); x.ellipse(cx - r * 0.34, cy - r * 0.45, r * 0.20, r * 0.12, -0.6, 0, Math.PI * 2); x.fill();
+  // mooring ring on top
+  x.strokeStyle = "rgba(62,38,34,0.85)"; x.lineWidth = 2.4;
+  x.beginPath(); x.arc(cx, cy - r * 0.88, r * 0.13, 0, Math.PI * 2); x.stroke();
+  // rim
+  x.strokeStyle = "rgba(105,22,26,0.5)"; x.lineWidth = 1.6;
+  x.beginPath(); x.arc(cx, cy, r - 0.8, 0, Math.PI * 2); x.stroke();
+  return { img: c, half: r + pad, size: (r + pad) * 2 };
+})();
+
+/* ═══════════════════════════ GAME STATE ═══════════════════════════════ */
+const S = { MENU: 0, PLAY: 1, DEAD: 2 };
+let state = S.MENU;
+let paused = false;
+let best = +(localStorage.getItem("gullRushBest") || 0);
+
+let time = 0, lastT = 0, oscPhase = 0;
+let gull, obstacles, fishes, floaters;
+let score, scoreStr, scorePop, speed, shake, flashT, deathT;
+let cloudsFar, cloudsNear, boats, islOff;
+let scoreFontSz = 0, scoreFont = "";   // cached HUD font string
+
+/* particle pool */
+const particles = [], pPool = [];
+function emit(x, y, vx, vy, life, r, color, grav, glow) {
+  const p = pPool.pop() || {};
+  p.x = x; p.y = y; p.vx = vx; p.vy = vy;
+  p.life = life; p.max = life; p.r = r; p.c = color;
+  p.g = grav; p.glow = !!glow;
+  particles.push(p);
+}
+function stepParticles(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx * dt; p.y += p.vy * dt; p.vy += p.g * dt; p.life -= dt;
+    if (p.life <= 0) {
+      particles[i] = particles[particles.length - 1];
+      particles.pop();
+      pPool.push(p);
+    }
+  }
+}
+
+function makeAmbient() {
+  cloudsFar = []; cloudsNear = []; boats = [];
+  for (let i = 0; i < 5; i++)
+    cloudsFar.push({ x: rnd(0, VW), y: rnd(36, 220), s: rnd(0.45, 0.7), spd: rnd(4, 8) });
+  for (let i = 0; i < 4; i++)
+    cloudsNear.push({ x: rnd(0, VW), y: rnd(60, 300), s: rnd(0.9, 1.35), spd: rnd(10, 18) });
+  for (let i = 0; i < 2; i++)
+    boats.push({ x: rnd(0, VW), spd: rnd(8, 14), s: rnd(0.65, 1.0), ph: rnd(0, 6.28) });
+  islOff = 0;
+}
+makeAmbient();
+
+function reset() {
+  gull = {
+    x: T.gullX, y: VH * 0.42, vy: 0, rot: 0,
+    flapT: 0, alive: true, splashed: false, spin: 0,
+  };
+  obstacles = [];
+  fishes = [];
+  floaters = [];
+  particles.length = 0;
+  score = 0; scoreStr = "0"; scorePop = 0;
+  speed = T.scrollBase;
+  shake = 0; flashT = 0; deathT = 0;
+  phase = 0; palKey = -1; oscPhase = 0;
+  for (let i = 0; i < 4; i++) spawnObstacle(VW + 140 + i * T.spacing);
+}
+
+function currentGap()  { return Math.max(T.gapMin, T.gapBase - score * T.gapShrink); }
+function currentAmp()  {
+  return score >= T.oscStart ? Math.min((score - T.oscStart) * T.oscAmpPer, T.oscAmpMax) : 0;
+}
+function currentOscSpeed() {
+  // second-stage ramp: oscillation quickens from score 40 → 90 so long
+  // runs toward GOLD/PEARL don't flatline at one difficulty
+  return lerp(T.oscSpeed, T.oscSpeedMax, clamp((score - 40) / 50, 0, 1));
+}
+function gapYOf(ob) {
+  // oscPhase is an accumulator (not time*speed) so ramping the speed
+  // never causes position jumps
+  return ob.amp ? ob.baseY + Math.sin(oscPhase + ob.ph) * ob.amp : ob.baseY;
+}
+
+function spawnObstacle(x) {
+  const gap = currentGap();
+  const amp = currentAmp();
+  const lo = 64 + gap / 2 + amp;
+  const hi = VH - T.waterH - 64 - gap / 2 - amp;
+  let gy = rnd(lo, hi);
+  const prev = obstacles[obstacles.length - 1];
+  if (prev) {
+    // fairness clamp: limit vertical shift between consecutive gaps
+    gy = clamp(gy, prev.baseY - 120, prev.baseY + 190);
+    gy = clamp(gy, lo, hi);
+  }
+  // neighbours share an oscillation phase so the fairness clamp above
+  // holds for the MOVING gaps too — random phases could stack up to
+  // ±2·amp of extra relative shift on top of the 120 px clamp
+  obstacles.push({ x, baseY: gy, gap, amp,
+                   ph: prev ? prev.ph : rnd(0, Math.PI * 2), passed: false });
+  if (Math.random() < T.fishChance) {
+    fishes.push({ x: x + T.spacing * 0.5, baseY: gy + rnd(-26, 26), wig: rnd(0, 6.28) });
+  }
+}
+
+/* ═════════════════════════════ INPUT ══════════════════════════════════ */
+const MUTE_BTN = { x: VW - 56, y: 14, w: 42, h: 42 };
+
+function flapNow() {
+  gull.vy = T.flap;
+  gull.flapT = 1;
+  AudioSys.flap();
+  for (let i = 0; i < 4; i++) {
+    emit(gull.x - 8, gull.y + 9, rnd(-130, -50), rnd(-20, 70),
+         rnd(0.25, 0.45), rnd(1.5, 3), "#dff2f8", 300);
+  }
+}
+
+function press() {
+  if (paused) {                       // resume tap never flaps
+    paused = false; lastT = 0;
+    // resume grace: drop stored fall momentum so the player has time
+    // to re-acquire the bird before it plummets
+    if (gull) gull.vy = Math.min(gull.vy, 0);
+    return;
+  }
+  if (state === S.MENU) { state = S.PLAY; flapNow(); return; }
+  if (state === S.PLAY) { flapNow(); return; }
+  if (state === S.DEAD && deathT > T.retryDelay) {
+    reset();
+    state = S.PLAY;
+    flapNow();
+  }
+}
+
+function handlePoint(clientX, clientY) {
+  AudioSys.ensure();
+  const r = canvas.getBoundingClientRect();
+  const vx = (clientX - r.left) / scale;
+  const vy = (clientY - r.top) / scale;
+  if (vx >= MUTE_BTN.x - 6 && vx <= MUTE_BTN.x + MUTE_BTN.w + 6 &&
+      vy >= MUTE_BTN.y - 6 && vy <= MUTE_BTN.y + MUTE_BTN.h + 6) {
+    AudioSys.toggleMute();
+    pausedDrawn = false;             // refresh the static pause frame's icon
+    return;
+  }
+  press();
+}
+function onPointer(e) { e.preventDefault(); handlePoint(e.clientX, e.clientY); }
+function onTouch(e) {
+  e.preventDefault();
+  const t = e.changedTouches[0];
+  handlePoint(t.clientX, t.clientY);
+}
+// exactly ONE touch input path — pointerdown where supported, else
+// touchstart + mousedown (binding pointerdown AND touchstart together
+// would double-fire on mobile; ≤ iOS 12 has no PointerEvent at all)
+if (window.PointerEvent) {
+  canvas.addEventListener("pointerdown", onPointer, { passive: false });
+} else {
+  canvas.addEventListener("touchstart", onTouch, { passive: false });
+  canvas.addEventListener("mousedown", onPointer);
+}
+canvas.addEventListener("contextmenu", e => e.preventDefault());
+document.addEventListener("gesturestart", e => e.preventDefault());
+document.addEventListener("dblclick", e => e.preventDefault());
+window.addEventListener("keydown", e => {
+  if (e.code === "Space" || e.code === "ArrowUp" || e.code === "KeyW") {
+    e.preventDefault();
+    if (e.repeat) return;
+    AudioSys.ensure();
+    press();
+  } else if (e.code === "KeyM") {
+    AudioSys.ensure();
+    AudioSys.toggleMute();
+    pausedDrawn = false;             // refresh the static pause frame's icon
+  }
+});
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden && state === S.PLAY) paused = true;
+});
+
+/* ═════════════════════════════ DEATH ══════════════════════════════════ */
+function makeSplash(x, n) {
+  AudioSys.splash();
+  for (let i = 0; i < n; i++) {
+    emit(x + rnd(-12, 12), VH - T.waterH + rnd(-2, 4),
+         rnd(-170, 170), rnd(-400, -120),
+         rnd(0.4, 0.9), rnd(2, 5), "#e6f6fb", 980);
+  }
+}
+
+function die(splashed) {
+  if (!gull.alive) return;
+  gull.alive = false;
+  state = S.DEAD;
+  deathT = 0;
+  shake = 18;
+  flashT = 0.22;
+  gull.spin = Math.random() < 0.5 ? -7 : 7;
+  AudioSys.hit();
+  if (score > best) { best = score; localStorage.setItem("gullRushBest", best); }
+  if (splashed) {
+    gull.splashed = true;
+    makeSplash(gull.x, 24);
+  } else {
+    gull.vy = Math.min(gull.vy, -240);  // knockback pop before the tumble
+    for (let i = 0; i < 12; i++) {
+      emit(gull.x, gull.y, rnd(-170, 170), rnd(-220, 60),
+           rnd(0.35, 0.7), rnd(2, 4), "#ffffff", 700);
+    }
+  }
+}
+
+function circleVsRect(cx, cy, cr, x0, y0, x1, y1) {
+  const nx = clamp(cx, x0, x1), ny = clamp(cy, y0, y1);
+  const dx = cx - nx, dy = cy - ny;
+  return dx * dx + dy * dy < cr * cr;
+}
+function circleVsCircle(ax, ay, ar, bx, by, br) {
+  const dx = ax - bx, dy = ay - by, r = ar + br;
+  return dx * dx + dy * dy < r * r;
+}
+
+/* ═════════════════════════════ UPDATE ═════════════════════════════════ */
+function update(dt) {
+  const ambF = state === S.PLAY ? 1 : 0.35;
+  const worldSpd = state === S.PLAY ? speed : 0;
+
+  for (const c of cloudsFar) {
+    c.x -= (c.spd + worldSpd * 0.06) * dt * ambF;
+    if (c.x < -110) { c.x = VW + 80; c.y = rnd(36, 220); c.s = rnd(0.45, 0.7); }
+  }
+  for (const c of cloudsNear) {
+    c.x -= (c.spd + worldSpd * 0.16) * dt * ambF;
+    if (c.x < -130) { c.x = VW + 100; c.y = rnd(60, 300); c.s = rnd(0.9, 1.35); }
+  }
+  for (const b of boats) {
+    b.x -= (b.spd + worldSpd * 0.10) * dt * ambF;
+    if (b.x < -90) { b.x = VW + 80; b.s = rnd(0.65, 1.0); b.spd = rnd(8, 14); }
+  }
+  islOff = (islOff + worldSpd * 0.05 * dt) % (VW * 2);
+
+  stepParticles(dt);
+  for (let i = floaters.length - 1; i >= 0; i--) {
+    const f = floaters[i];
+    f.y -= 48 * dt; f.life -= dt;
+    if (f.life <= 0) floaters.splice(i, 1);
+  }
+  scorePop = Math.max(0, scorePop - dt * 3.2);
+  shake = Math.max(0, shake - dt * 55);
+  flashT = Math.max(0, flashT - dt);
+  if (gull) gull.flapT = Math.max(0, gull.flapT - dt * 4.5);
+
+  // sky drifts day → sunset → dusk with score
+  const phTarget = clamp(score / 50, 0, 1);
+  phase += (phTarget - phase) * Math.min(1, dt * 0.6);
+  refreshPalette();
+
+  oscPhase += currentOscSpeed() * dt;
+
+  if (state === S.MENU) {
+    gull.y = VH * 0.66 + Math.sin(time * 2.4) * 8;  // idle hover, below the title panel
+  }
+
+  if (state === S.PLAY) {
+    // ease toward the target so a fish (+3) nudges rather than lurches
+    const targetSpd = Math.min(T.scrollBase + score * T.scrollRamp, T.scrollMax);
+    speed += (targetSpd - speed) * Math.min(1, dt * 2);
+
+    // gull physics — trapezoidal integration, so flap arc height is
+    // identical at 20 fps and 120 fps (semi-implicit Euler loses ~15%
+    // of climb at the dt=0.05 clamp)
+    const vy0 = gull.vy;
+    gull.vy = clamp(gull.vy + T.gravity * dt, T.flap, T.maxFall);
+    gull.y += (vy0 + gull.vy) * 0.5 * dt;
+    const targetRot = clamp(gull.vy / 580, -0.45, 1.25);
+    gull.rot += (targetRot - gull.rot) * Math.min(1, dt * 14);
+    if (gull.y < T.gullR) { gull.y = T.gullR; gull.vy = 0; }
+    if (gull.y > VH - T.waterH - T.gullR + 5) {
+      gull.y = VH - T.waterH - T.gullR + 5;
+      die(true);
+    }
+
+    // obstacles
+    for (const ob of obstacles) {
+      ob.x -= speed * dt;
+      if (!ob.passed && ob.x + T.buoyW / 2 < gull.x) {
+        ob.passed = true;            // never double-counted
+        score++;
+        scoreStr = "" + score;
+        scorePop = 1;
+        AudioSys.score();
+      }
+      if (gull.alive) {
+        const gy = gapYOf(ob);       // collide against CURRENT gap position
+        const br = T.buoyW / 2;
+        const gapTop = gy - ob.gap / 2, gapBot = gy + ob.gap / 2;
+        const x0 = ob.x - br, x1 = ob.x + br;
+        // the end buoys nearest the gap are drawn round — collide them as
+        // circles so the bare rect corners can't kill a gull that visibly
+        // cleared the curved silhouette (~12 px phantom zone otherwise)
+        if (circleVsCircle(gull.x, gull.y, T.gullR, ob.x, gapTop - br, br) ||
+            circleVsCircle(gull.x, gull.y, T.gullR, ob.x, gapBot + br, br) ||
+            circleVsRect(gull.x, gull.y, T.gullR, x0, -60, x1, gapTop - br) ||
+            circleVsRect(gull.x, gull.y, T.gullR, x0, gapBot + br, x1, VH - T.waterH + 30)) {
+          die(false);
+        }
+      }
+    }
+    if (obstacles.length && obstacles[0].x < -T.buoyW - buoySprite.half) obstacles.shift();
+    while (obstacles.length &&
+           obstacles[obstacles.length - 1].x < VW + T.spacing * 1.5) {
+      spawnObstacle(obstacles[obstacles.length - 1].x + T.spacing);
+    }
+
+    // golden fish
+    for (let i = fishes.length - 1; i >= 0; i--) {
+      const f = fishes[i];
+      f.x -= speed * dt;
+      f.wig += dt * 9;
+      if (f.x < -40) { fishes.splice(i, 1); continue; }
+      const fy = f.baseY + Math.sin(f.wig) * 11;
+      const dx = f.x - gull.x, dy = fy - gull.y;
+      const rr = T.gullR + 14;
+      if (dx * dx + dy * dy < rr * rr) {
+        fishes.splice(i, 1);
+        score += 3;
+        scoreStr = "" + score;
+        scorePop = 1;
+        AudioSys.fish();
+        floaters.push({ x: f.x, y: fy - 12, txt: "+3", life: 0.9 });
+        for (let j = 0; j < 14; j++) {
+          emit(f.x, fy, rnd(-150, 150), rnd(-160, 120),
+               rnd(0.3, 0.65), rnd(1.5, 3.5), "#ffd86b", 180, true);
+        }
+      }
+    }
+  }
+
+  if (state === S.DEAD) {
+    deathT += dt;
+    const floorY = VH - T.waterH - 4;
+    if (!gull.splashed) {
+      // tumble out of the sky
+      gull.vy = clamp(gull.vy + T.gravity * dt, -900, T.maxFall);
+      gull.y += gull.vy * dt;
+      gull.rot += gull.spin * dt;
+      if (gull.y >= floorY) {
+        gull.y = floorY;
+        gull.splashed = true;
+        makeSplash(gull.x, 20);
+      }
+    } else {
+      // bob belly-up in the swell
+      gull.y = floorY + 6 + Math.sin(time * 2.6) * 2;
+      const settle = Math.PI * (gull.spin < 0 ? -1 : 1);
+      gull.rot += (settle - gull.rot) * Math.min(1, dt * 3);
+    }
+  }
+}
+
+/* ════════════════════════════ RENDER: WORLD ═══════════════════════════ */
+function drawSky() {
+  ctx.fillStyle = P.sky;
+  ctx.fillRect(0, 0, VW, VH - T.waterH);
+
+  // stars fade in at dusk
+  if (P.starA > 0.01) {
+    ctx.fillStyle = "#fff";
+    for (const s of STARS) {
+      ctx.globalAlpha = P.starA * (0.4 + 0.6 * Math.abs(Math.sin(time * 1.2 + s.tw)));
+      ctx.fillRect(s.x, s.y, s.r, s.r);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // sun sinks toward the horizon as dusk approaches
+  const e = phase * phase;
+  const sx = VW - 78 - phase * 70;
+  const sy = lerp(96, VH - T.waterH - 36, e);
+  ctx.globalAlpha = 0.30 * (1 - phase * 0.5);
+  ctx.fillStyle = P.sunFill;
+  ctx.beginPath(); ctx.arc(sx, sy, 72, 0, Math.PI * 2); ctx.fill();
+  ctx.globalAlpha = 0.85 - phase * 0.35;
+  ctx.beginPath(); ctx.arc(sx, sy, 42, 0, Math.PI * 2); ctx.fill();
+  ctx.globalAlpha = 1;
+}
+
+function puff(x, y, r) { ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, Math.PI * 2); }
+function drawCloudLayer(layer, fill) {
+  ctx.fillStyle = fill;
+  for (const c of layer) {
+    ctx.save();
+    ctx.translate(c.x, c.y);
+    ctx.scale(c.s, c.s);
+    ctx.beginPath();
+    puff(0, 0, 26); puff(26, 6, 19); puff(-24, 7, 17); puff(7, -11, 18);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+const ISLANDS = [
+  { x: 110, w: 170, h: 26, light: false },
+  { x: 430, w: 120, h: 18, light: true  },
+  { x: 660, w: 190, h: 30, light: false },
+];
+function drawIslands() {
+  const hy = VH - T.waterH;
+  const loop = VW * 2;
+  for (const isl of ISLANDS) {
+    let x = isl.x - islOff;
+    if (x < -loop / 2) x += loop;
+    if (x > loop) x -= loop;
+    if (x < -isl.w || x > VW + isl.w) continue;
+
+    // far haze hump behind
+    ctx.fillStyle = P.islandFar;
+    ctx.beginPath();
+    ctx.ellipse(x + isl.w * 0.3, hy + 4, isl.w * 0.75, isl.h * 1.25, 0, Math.PI, 0);
+    ctx.fill();
+    // main island
+    ctx.fillStyle = P.island;
+    ctx.beginPath();
+    ctx.ellipse(x, hy + 3, isl.w * 0.55, isl.h, 0, Math.PI, 0);
+    ctx.fill();
+
+    if (isl.light) {
+      // lighthouse
+      const lx = x, base = hy - isl.h * 0.55, hh = 44;
+      ctx.fillStyle = "#e8e4da";
+      ctx.beginPath();
+      ctx.moveTo(lx - 6, base); ctx.lineTo(lx + 6, base);
+      ctx.lineTo(lx + 4, base - hh); ctx.lineTo(lx - 4, base - hh);
+      ctx.closePath(); ctx.fill();
+      ctx.fillStyle = "#c84a48";
+      ctx.fillRect(lx - 5.4, base - hh * 0.42, 10.8, 7);
+      ctx.fillRect(lx - 4.7, base - hh * 0.78, 9.4, 6);
+      // lamp house + cap
+      ctx.fillStyle = "#3a3f48";
+      ctx.fillRect(lx - 4.5, base - hh - 7, 9, 7);
+      ctx.beginPath();
+      ctx.moveTo(lx - 6, base - hh - 7); ctx.lineTo(lx + 6, base - hh - 7);
+      ctx.lineTo(lx, base - hh - 13); ctx.closePath(); ctx.fill();
+      // blinking lamp
+      const lampA = Math.pow(Math.max(0, Math.sin(time * 1.8)), 10);
+      if (lampA > 0.02) {
+        const ly = base - hh - 3.5;
+        ctx.globalAlpha = lampA;
+        ctx.fillStyle = "#fff2a8";
+        ctx.beginPath(); ctx.arc(lx, ly, 3, 0, Math.PI * 2); ctx.fill();
+        ctx.globalAlpha = lampA * 0.35;
+        ctx.beginPath(); ctx.arc(lx, ly, 10, 0, Math.PI * 2); ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+    }
+  }
+}
+
+function drawBoats() {
+  const hy = VH - T.waterH;
+  for (const b of boats) {
+    ctx.save();
+    ctx.translate(b.x, hy + 1 + Math.sin(time * 1.6 + b.ph) * 2);
+    ctx.rotate(Math.sin(time * 1.3 + b.ph) * 0.05);
+    ctx.scale(b.s, b.s);
+    ctx.fillStyle = "#7a4f34";
+    ctx.beginPath();
+    ctx.moveTo(-22, 0); ctx.lineTo(22, 0); ctx.lineTo(14, 11); ctx.lineTo(-14, 11);
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = "#4e3322"; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(0, -28); ctx.lineTo(0, 0); ctx.stroke();
+    ctx.fillStyle = "#f4f1e8";
+    ctx.beginPath();
+    ctx.moveTo(1.5, -26); ctx.lineTo(1.5, -3); ctx.lineTo(17, -3);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = "#d8606a";
+    ctx.beginPath();
+    ctx.moveTo(-1.5, -24); ctx.lineTo(-1.5, -5); ctx.lineTo(-15, -5);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+}
+
+function drawWaterBack() {
+  const wy = VH - T.waterH;
+  ctx.fillStyle = P.water;
+  ctx.fillRect(0, wy - 2, VW, T.waterH + 2);
+
+  // gull's shadow on the swell
+  if (gull) {
+    const hFrac = clamp(1 - (wy - gull.y) / (VH - T.waterH), 0.1, 1);
+    ctx.globalAlpha = 0.16 * hFrac;
+    ctx.fillStyle = "#062a38";
+    ctx.beginPath();
+    ctx.ellipse(gull.x, wy + 9, 16 * hFrac + 8, 4, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawWaterFront() {
+  const wy = VH - T.waterH;
+
+  // translucent crest band so the gull visually sinks into the surf
+  ctx.fillStyle = P.water;
+  ctx.globalAlpha = 0.55;
+  ctx.beginPath();
+  ctx.moveTo(0, wy + 22);
+  for (let x = 0; x <= VW; x += 10) {
+    ctx.lineTo(x, wy + Math.sin(x * 0.05 + time * 2.6) * 4 + Math.sin(x * 0.11 - time * 1.7) * 2);
+  }
+  ctx.lineTo(VW, wy + 22);
+  ctx.closePath(); ctx.fill();
+  ctx.globalAlpha = 1;
+
+  // foam crest
+  ctx.strokeStyle = "rgba(255,255,255,0.65)";
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  for (let x = 0; x <= VW; x += 8) {
+    const y = wy + Math.sin(x * 0.05 + time * 2.6) * 4 + Math.sin(x * 0.11 - time * 1.7) * 2;
+    x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+  // second softer wave line
+  ctx.strokeStyle = "rgba(255,255,255,0.22)";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (let x = 0; x <= VW; x += 10) {
+    const y = wy + 16 + Math.sin(x * 0.045 - time * 2.0) * 3.5;
+    x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+  // shimmer dashes
+  ctx.fillStyle = "rgba(255,255,255,0.12)";
+  for (let i = 0; i < 7; i++) {
+    const x = ((i * 73 + time * 34) % (VW + 60)) - 30;
+    ctx.fillRect(x, wy + 26 + (i % 3) * 17, 24, 3);
+  }
+}
+
+function drawObstacles() {
+  const r = T.buoyW / 2;
+  const step = r * 1.6;
+  ctx.strokeStyle = "rgba(36,52,62,0.5)";
+  ctx.lineWidth = 3;
+  for (const ob of obstacles) {
+    if (ob.x - buoySprite.half > VW) continue;   // spawned ahead, not on screen yet
+    const gy = gapYOf(ob);
+    const gapTop = gy - ob.gap / 2;
+    const gapBot = gy + ob.gap / 2;
+    // mooring ropes
+    ctx.beginPath();
+    ctx.moveTo(ob.x, -10); ctx.lineTo(ob.x, gapTop - 4);
+    ctx.moveTo(ob.x, gapBot + 4); ctx.lineTo(ob.x, VH - T.waterH + 16);
+    ctx.stroke();
+    // top chain (hangs down to the gap) — the end buoy (i=0) doesn't bob
+    // so the drawn silhouette matches the hitbox at the gap edge
+    let y = gapTop - r, i = 0;
+    while (y > -r && i < 24) {
+      const bob = i === 0 ? 0 : Math.sin(time * 2 + ob.x * 0.05 + i * 1.1) * 2;
+      ctx.drawImage(buoySprite.img, ob.x - buoySprite.half, y + bob - buoySprite.half,
+                    buoySprite.size, buoySprite.size);
+      y -= step; i++;
+    }
+    // bottom chain (rises from the sea to the gap)
+    y = gapBot + r; i = 0;
+    while (y < VH - T.waterH + r && i < 24) {
+      const bob = i === 0 ? 0 : Math.sin(time * 2 + ob.x * 0.05 + i * 1.3 + 2) * 2;
+      ctx.drawImage(buoySprite.img, ob.x - buoySprite.half, y + bob - buoySprite.half,
+                    buoySprite.size, buoySprite.size);
+      y += step; i++;
+    }
+  }
+}
+
+function drawFishes() {
+  for (const f of fishes) {
+    if (f.x - 22 > VW) continue;     // spawned ahead, not on screen yet
+    const fy = f.baseY + Math.sin(f.wig) * 11;
+    ctx.save();
+    ctx.translate(f.x, fy);
+    // glow halo
+    ctx.fillStyle = "rgba(255,210,74,0.22)";
+    ctx.beginPath(); ctx.arc(0, 0, 18 + Math.sin(time * 5) * 2, 0, Math.PI * 2); ctx.fill();
+    ctx.rotate(Math.sin(f.wig * 1.4) * 0.2);
+    // body
+    ctx.fillStyle = "#ffd24a";
+    ctx.beginPath(); ctx.ellipse(0, 0, 13, 8, 0, 0, Math.PI * 2); ctx.fill();
+    // tail
+    ctx.fillStyle = "#f0a338";
+    ctx.beginPath();
+    ctx.moveTo(10, 0); ctx.lineTo(20, -7); ctx.lineTo(20, 7);
+    ctx.closePath(); ctx.fill();
+    // fin
+    ctx.beginPath();
+    ctx.moveTo(-2, -6); ctx.lineTo(3, -12); ctx.lineTo(6, -5);
+    ctx.closePath(); ctx.fill();
+    // belly shine + eye
+    ctx.fillStyle = "rgba(255,255,255,0.4)";
+    ctx.beginPath(); ctx.ellipse(-3, 3, 7, 3, 0.2, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#20303a";
+    ctx.beginPath(); ctx.arc(-7, -2, 1.8, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+}
+
+function drawGull() {
+  if (!gull) return;
+  ctx.save();
+  ctx.translate(gull.x, gull.y);
+  ctx.rotate(state === S.MENU ? Math.sin(time * 2.2) * 0.08 : gull.rot);
+
+  // wing lift: 0 = folded down, 1 = raised mid-flap
+  let lift;
+  if (state === S.MENU) lift = (Math.sin(time * 7) + 1) * 0.5;
+  else lift = Math.sin(Math.min(gull.flapT, 1) * Math.PI);
+  const wingAng = lerp(0.55, -1.15, lift);
+
+  function wing(dir, fill, tip) {
+    ctx.save();
+    ctx.translate(-3, -3);
+    ctx.rotate(wingAng * dir);
+    ctx.fillStyle = fill;
+    ctx.beginPath();
+    ctx.moveTo(2, 0);
+    ctx.quadraticCurveTo(-10, 2, -22, 12);
+    ctx.quadraticCurveTo(-24, 14, -20, 14);
+    ctx.quadraticCurveTo(-6, 12, 4, 5);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = tip;  // dark wingtip
+    ctx.beginPath();
+    ctx.moveTo(-15, 9);
+    ctx.quadraticCurveTo(-22, 12, -22.5, 13.5);
+    ctx.quadraticCurveTo(-18, 14.5, -13, 12.5);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+
+  // far wing (behind body, slightly offset)
+  wing(0.7, "#b9c6cf", "#48555e");
+
+  // tail
+  ctx.fillStyle = "#e3e9ed";
+  ctx.beginPath();
+  ctx.moveTo(-13, -1); ctx.lineTo(-26, -6); ctx.lineTo(-23, 4);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = "#3a4750";
+  ctx.beginPath();
+  ctx.moveTo(-21, -4); ctx.lineTo(-26, -6); ctx.lineTo(-24, 0);
+  ctx.closePath(); ctx.fill();
+
+  // body
+  ctx.fillStyle = "#f6f8fa";
+  ctx.beginPath(); ctx.ellipse(0, 0, 17, 12, 0, 0, Math.PI * 2); ctx.fill();
+  // grey mantle
+  ctx.fillStyle = "#c9d3da";
+  ctx.beginPath(); ctx.ellipse(-3, -3, 14, 8, -0.1, Math.PI, Math.PI * 2); ctx.fill();
+  // thin contour so the white body reads against bright day sky + clouds
+  ctx.strokeStyle = "rgba(45,62,72,0.5)"; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.ellipse(0, 0, 17, 12, 0, 0, Math.PI * 2); ctx.stroke();
+
+  // head
+  ctx.fillStyle = "#f6f8fa";
+  ctx.beginPath(); ctx.arc(13, -6, 9, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = "rgba(45,62,72,0.5)"; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.arc(13, -6, 9, -2.6, 1.2); ctx.stroke();  // partial arc — skips the neck join
+
+  // beak — opens slightly mid-flap
+  const open = lift * 1.6;
+  ctx.fillStyle = "#ff9b21";
+  ctx.beginPath();
+  ctx.moveTo(20, -7.5); ctx.lineTo(31, -4.5 - open); ctx.lineTo(20, -4);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = "#e8830f";
+  ctx.beginPath();
+  ctx.moveTo(20, -3.5); ctx.lineTo(30, -2.5 + open); ctx.lineTo(20, -1);
+  ctx.closePath(); ctx.fill();
+
+  // eye
+  if (gull.alive) {
+    ctx.fillStyle = "#1a2a33";
+    ctx.beginPath(); ctx.arc(16, -7.5, 2.2, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#fff";
+    ctx.beginPath(); ctx.arc(16.8, -8.3, 0.8, 0, Math.PI * 2); ctx.fill();
+  } else {
+    ctx.strokeStyle = "#1a2a33"; ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.moveTo(13.6, -9.9); ctx.lineTo(18.4, -5.1);
+    ctx.moveTo(18.4, -9.9); ctx.lineTo(13.6, -5.1);
+    ctx.stroke();
+  }
+
+  // near wing (in front)
+  wing(1, "#e4ebef", "#5a6770");
+
+  ctx.restore();
+}
+
+function drawParticles() {
+  let hasGlow = false;
+  for (const p of particles) {
+    if (p.glow) { hasGlow = true; continue; }
+    ctx.globalAlpha = clamp(p.life / p.max * 1.4, 0, 1);
+    ctx.fillStyle = p.c;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+  }
+  if (hasGlow) {
+    ctx.globalCompositeOperation = "lighter";
+    for (const p of particles) {
+      if (!p.glow) continue;
+      ctx.globalAlpha = clamp(p.life / p.max, 0, 1);
+      ctx.fillStyle = p.c;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalCompositeOperation = "source-over";
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawFloaters() {
+  if (!floaters.length) return;      // skip the (pricey) ctx.font set when idle
+  ctx.textAlign = "center";
+  ctx.font = "800 24px -apple-system, system-ui, sans-serif";
+  for (const f of floaters) {
+    ctx.globalAlpha = clamp(f.life * 1.5, 0, 1);
+    ctx.strokeStyle = "rgba(90,50,0,0.8)"; ctx.lineWidth = 4;
+    ctx.strokeText(f.txt, f.x, f.y);
+    ctx.fillStyle = "#ffd24a";
+    ctx.fillText(f.txt, f.x, f.y);
+  }
+  ctx.globalAlpha = 1;
+}
+
+/* ════════════════════════ RENDER: HUD / SCREENS ═══════════════════════ */
+function drawMuteBtn() {
+  const b = MUTE_BTN;
+  ctx.fillStyle = "rgba(10,32,44,0.45)";
+  roundRect(b.x, b.y, b.w, b.h, 10);
+  ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,0.35)"; ctx.lineWidth = 1.5;
+  roundRect(b.x, b.y, b.w, b.h, 10);
+  ctx.stroke();
+  const cx = b.x + b.w / 2 - 3, cy = b.y + b.h / 2;
+  // speaker
+  ctx.fillStyle = "#eaf4f8";
+  ctx.beginPath();
+  ctx.moveTo(cx - 8, cy - 4); ctx.lineTo(cx - 3, cy - 4);
+  ctx.lineTo(cx + 3, cy - 9); ctx.lineTo(cx + 3, cy + 9);
+  ctx.lineTo(cx - 3, cy + 4); ctx.lineTo(cx - 8, cy + 4);
+  ctx.closePath(); ctx.fill();
+  if (AudioSys.muted) {
+    ctx.strokeStyle = "#ff6b5e"; ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(b.x + 8, b.y + b.h - 8); ctx.lineTo(b.x + b.w - 8, b.y + 8);
+    ctx.stroke();
+  } else {
+    ctx.strokeStyle = "#eaf4f8"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(cx + 5, cy, 6, -0.9, 0.9); ctx.stroke();
+    ctx.beginPath(); ctx.arc(cx + 5, cy, 10, -0.8, 0.8); ctx.stroke();
+  }
+}
+
+function pulseText(text, y) {
+  ctx.globalAlpha = 0.6 + Math.sin(time * 4.5) * 0.4;
+  ctx.fillStyle = "#ffd24a";
+  ctx.font = "800 27px -apple-system, system-ui, sans-serif";
+  ctx.fillText(text, VW / 2, y);
+  ctx.globalAlpha = 1;
+}
+
+function panel(y, h) {
+  ctx.fillStyle = "rgba(8,30,44,0.72)";
+  roundRect(VW / 2 - 152, y, 304, h, 20);
+  ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,0.18)"; ctx.lineWidth = 2;
+  roundRect(VW / 2 - 152, y, 304, h, 20);
+  ctx.stroke();
+}
+
+function drawMedal(cx, cy, m) {
+  // ribbon
+  ctx.fillStyle = "#c8403e";
+  ctx.beginPath();
+  ctx.moveTo(cx - 10, cy - 34); ctx.lineTo(cx - 2, cy - 12); ctx.lineTo(cx - 16, cy - 12);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = "#2d4d8f";
+  ctx.beginPath();
+  ctx.moveTo(cx + 10, cy - 34); ctx.lineTo(cx + 16, cy - 12); ctx.lineTo(cx + 2, cy - 12);
+  ctx.closePath(); ctx.fill();
+  // disc (gradient memoized per medal — cx/cy are fixed)
+  if (!m.grad) {
+    const g = ctx.createRadialGradient(cx - 7, cy - 7, 3, cx, cy, 24);
+    g.addColorStop(0, m.c1); g.addColorStop(0.6, m.c2); g.addColorStop(1, m.c3);
+    m.grad = g;
+  }
+  ctx.fillStyle = m.grad;
+  ctx.beginPath(); ctx.arc(cx, cy, 22, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = m.c3; ctx.lineWidth = 2.5;
+  ctx.beginPath(); ctx.arc(cx, cy, 22, 0, Math.PI * 2); ctx.stroke();
+  ctx.strokeStyle = "rgba(255,255,255,0.5)"; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.arc(cx, cy, 17, 0, Math.PI * 2); ctx.stroke();
+  // star
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) {
+    const a = -Math.PI / 2 + i * Math.PI / 5;
+    const rr = i % 2 === 0 ? 9 : 4;
+    const px = cx + Math.cos(a) * rr, py = cy + Math.sin(a) * rr;
+    i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+  }
+  ctx.closePath(); ctx.fill();
+}
+
+function drawHUD() {
+  ctx.textAlign = "center";
+
+  if (state !== S.MENU) {
+    const sz = Math.round(54 * (1 + scorePop * 0.32));
+    if (sz !== scoreFontSz) {        // sz only changes during the ~0.3 s pop
+      scoreFontSz = sz;
+      scoreFont = "800 " + sz + "px -apple-system, system-ui, sans-serif";
+    }
+    ctx.font = scoreFont;
+    ctx.strokeStyle = "rgba(255,255,255,0.92)"; ctx.lineWidth = 5;
+    ctx.strokeText(scoreStr, VW / 2, 92);
+    ctx.fillStyle = "rgba(16,40,52,0.9)";
+    ctx.fillText(scoreStr, VW / 2, 92);
+  }
+
+  if (state === S.MENU) {
+    panel(VH * 0.20, VH * 0.40);
+    ctx.fillStyle = "#fff";
+    ctx.font = "800 46px -apple-system, system-ui, sans-serif";
+    ctx.fillText("GULL RUSH", VW / 2, VH * 0.20 + 64 + Math.sin(time * 2.2) * 3);
+    ctx.font = "600 17px -apple-system, system-ui, sans-serif";
+    ctx.fillStyle = "#cfe8f2";
+    ctx.fillText("tap · space · ↑ to flap", VW / 2, VH * 0.20 + 108);
+    ctx.fillText("thread the buoys", VW / 2, VH * 0.20 + 134);
+    ctx.fillStyle = "#ffd24a";
+    ctx.fillText("golden fish = +3", VW / 2, VH * 0.20 + 160);
+    pulseText("TAP TO START", VH * 0.20 + 212);
+    ctx.font = "600 16px -apple-system, system-ui, sans-serif";
+    ctx.fillStyle = "#9fc4d4";
+    ctx.fillText("best  " + best, VW / 2, VH * 0.20 + 252);
+  }
+
+  if (state === S.DEAD && deathT > 0.35) {
+    const a = clamp((deathT - 0.35) / 0.3, 0, 1);
+    ctx.globalAlpha = a;
+    const py = VH * 0.20;
+    panel(py, VH * 0.46);
+    ctx.fillStyle = "#fff";
+    ctx.font = "800 38px -apple-system, system-ui, sans-serif";
+    ctx.fillText("SPLASHDOWN!", VW / 2, py + 54);
+
+    let medal = null;
+    for (const m of MEDALS) if (score >= m.min) { medal = m; break; }
+    if (medal) {
+      drawMedal(VW / 2 - 92, py + 122, medal);
+      ctx.font = "700 13px -apple-system, system-ui, sans-serif";
+      ctx.fillStyle = medal.c2;
+      ctx.fillText(medal.name, VW / 2 - 92, py + 160);
+    }
+    const tx = medal ? VW / 2 + 36 : VW / 2;
+    ctx.fillStyle = "#cfe8f2";
+    ctx.font = "600 16px -apple-system, system-ui, sans-serif";
+    ctx.fillText("SCORE", tx, py + 102);
+    ctx.fillStyle = "#fff";
+    ctx.font = "800 34px -apple-system, system-ui, sans-serif";
+    ctx.fillText(scoreStr, tx, py + 136);
+    const isNewBest = score >= best && score > 0;
+    ctx.font = "600 16px -apple-system, system-ui, sans-serif";
+    ctx.fillStyle = isNewBest ? "#ffd24a" : "#9fc4d4";
+    ctx.fillText(isNewBest ? "★ new best  " + best : "best  " + best, tx, py + 166);
+
+    if (deathT > T.retryDelay) pulseText("TAP TO RETRY", py + 232);
+    else if (deathT > 0.5) {         // delayed so the dim prompt doesn't imply taps work yet
+      ctx.globalAlpha = a * 0.4;
+      ctx.fillStyle = "#ffd24a";
+      ctx.font = "800 27px -apple-system, system-ui, sans-serif";
+      ctx.fillText("TAP TO RETRY", VW / 2, py + 232);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  drawMuteBtn();
+}
+
+function drawPauseOverlay() {
+  ctx.fillStyle = "rgba(4,18,28,0.62)";
+  ctx.fillRect(0, 0, VW, VH);
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#fff";
+  ctx.font = "800 38px -apple-system, system-ui, sans-serif";
+  ctx.fillText("PAUSED", VW / 2, VH * 0.44);
+  // fixed alpha (no pulse) — the pause frame is drawn once and frozen,
+  // so a time-driven pulse would stick at a random brightness
+  ctx.fillStyle = "#ffd24a";
+  ctx.font = "800 27px -apple-system, system-ui, sans-serif";
+  ctx.fillText("TAP TO RESUME", VW / 2, VH * 0.44 + 52);
+}
+
+/* ════════════════════════════ MAIN DRAW ═══════════════════════════════ */
+function draw() {
+  // fresh transform every frame — never accumulates; derived from the
+  // ACTUAL backing-store size so rounding can't leave an unpainted hairline
+  ctx.setTransform(canvas.width / VW, 0, 0, canvas.height / VH, 0, 0);
+
+  if (shake > 0) ctx.translate(rnd(-shake, shake) * 0.45, rnd(-shake, shake) * 0.45);
+
+  drawSky();
+  drawCloudLayer(cloudsFar, P.cloudFar);
+  drawIslands();
+  drawWaterBack();
+  drawBoats();
+  drawCloudLayer(cloudsNear, P.cloudNear);
+  drawObstacles();
+  drawFishes();
+  drawParticles();
+  drawGull();
+  drawWaterFront();
+  drawFloaters();
+
+  if (flashT > 0) {
+    ctx.fillStyle = "rgba(255,255,255," + Math.min(1, flashT * 4) + ")";
+    ctx.fillRect(-30, -30, VW + 60, VH + 60);
+  }
+
+  drawHUD();
+  if (paused) drawPauseOverlay();
+}
+
+/* ═════════════════════════════ LOOP ═══════════════════════════════════ */
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (!lastT) { lastT = now; return; }
+  let dt = (now - lastT) / 1000;
+  lastT = now;
+  if (dt > 0.05) dt = 0.05;   // clamp tab-switch spikes
+  if (paused) {
+    // nothing animates while paused — draw the frozen frame once, then
+    // skip redraws entirely (battery/thermals during auto-pause)
+    if (!pausedDrawn) { draw(); pausedDrawn = true; }
+    return;
+  }
+  pausedDrawn = false;
+  time += dt;
+  update(dt);
+  draw();
+}
+
+reset();
+refreshPalette();
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
